@@ -1,5 +1,16 @@
-# systemd unit for running FreeDeepseekAPI as a permanent service on a VPS.
-# Install steps: README → "Постоянный сервис на VPS (systemd)".
+# ==============================================================================
+# TEMPLATE ONLY — DO NOT COPY VERBATIM FOR CUSTOM INSTALL PATHS!
+# ==============================================================================
+# Run `sudo ./deploy/install.sh` (or `deploy/quick-install.sh`) instead.
+# The installer dynamically generates /etc/systemd/system/free-deepseek-api.service
+# with:
+#   - WorkingDirectory=<actual PROJECT_DIR>
+#   - ExecStart=<resolved absolute NODE_BIN> server.js
+#   - Adaptive ProtectHome (read-only if project/node/auth/key is in /home or
+#     /root; true otherwise — ProtectHome=true hides /home & /root and causes
+#     status=200/CHDIR!)
+# ==============================================================================
+
 [Unit]
 Description=FreeDeepseekAPI (OpenAI/Anthropic-compatible proxy for DeepSeek Web)
 After=network-online.target
@@ -9,7 +20,8 @@ Wants=network-online.target
 Type=simple
 User=freedeepseek
 Group=freedeepseek
-WorkingDirectory=/opt/FreeDeepseekAPI
+# Template default path; install.sh sets WorkingDirectory dynamically.
+WorkingDirectory=/opt/deepseek-free-proxy
 Environment=NODE_ENV=production
 Environment=NON_INTERACTIVE=1
 Environment=HOST=127.0.0.1
@@ -17,7 +29,7 @@ Environment=PORT=9655
 Environment=DEEPSEEK_AUTH_PATH=/etc/free-deepseek-api/deepseek-auth.json
 Environment=PROXY_API_KEY_FILE=/etc/free-deepseek-api/proxy-api-key
 Environment=REQUIRE_PROXY_API_KEY=1
-# Optional overrides (HOST, DEEPSEEK_* settings); later values win.
+# Optional overrides (HOST, PORT, DEEPSEEK_* settings); later values win.
 EnvironmentFile=-/etc/free-deepseek-api/env
 ExecStart=/usr/bin/env node server.js
 Restart=on-failure
@@ -29,6 +41,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
+# Template default for /opt installs. Set ProtectHome=read-only if project,
+# node binary, auth, or key directory resides under /home or /root.
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

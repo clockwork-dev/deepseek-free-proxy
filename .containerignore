@@ -7,3 +7,6 @@
 !server.js
 !lib/
 !lib/pow.js
+!lib/env.js
+!src/
+!src/**
