@@ -18,6 +18,8 @@ test('security: codebase contains zero traces of watermark or old author brandin
     'scripts/doctor.js',
     'scripts/ensure_browser.js',
     'scripts/deepseek_chrome_auth.js',
+    'scripts/setup_wizard.js',
+    'cli.js',
     'lib/pow.js',
     'lib/env.js',
     'src/server.js',
