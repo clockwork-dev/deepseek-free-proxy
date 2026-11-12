@@ -1,0 +1,1 @@
+../deploy/uninstall.sh
