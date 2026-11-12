@@ -5,10 +5,13 @@
   "main": "server.js",
   "bin": {
     "free-deepseek-api": "./server.js",
+    "free-deepseek-cli": "./cli.js",
     "free-deepseek-client": "./client.js"
   },
   "scripts": {
     "start": "node server.js",
+    "cli": "node cli.js",
+    "setup": "node scripts/setup_wizard.js",
     "auth": "node scripts/auth.js",
     "auth:import": "node scripts/auth_import.js",
     "browser:install": "node scripts/ensure_browser.js --install",
