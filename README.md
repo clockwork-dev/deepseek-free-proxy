@@ -9,7 +9,7 @@
   <img alt="Node.js 18 plus" src="https://img.shields.io/badge/node-18%2B-339933.svg" />
   <img alt="No npm dependencies" src="https://img.shields.io/badge/dependencies-0-blue.svg" />
   <img alt="OpenAI compatible" src="https://img.shields.io/badge/OpenAI-compatible-111111.svg" />
-  <img alt="Tests Passing" src="https://img.shields.io/badge/tests-155%20passed-brightgreen.svg" />
+  <img alt="Tests Passing" src="https://img.shields.io/badge/tests-165%20passed-brightgreen.svg" />
 </p>
 
 <p align="center">
@@ -20,6 +20,7 @@
   <a href="#-примеры-запросов">Примеры</a> •
   <a href="#-модели">Модели</a> •
   <a href="#-постоянный-сервис-на-linux-systemd">Systemd сервис</a> •
+  <a href="#-подключение-к-hermes-agent">Hermes</a> •
   <a href="#-open-webui">Open WebUI</a>
 </p>
 
@@ -36,9 +37,11 @@ FreeDeepseekAPI поднимает локальный API-сервер для **
 - [Что это даёт](#-что-это-даёт)
 - [Возможности](#-возможности)
 - [Быстрый старт](#-быстрый-старт)
+  - [Установка одной командой (Linux & macOS)](#-установка-одной-командой-linux--macos)
 - [Интерактивный CLI и Control Center](#-интерактивный-cli-и-control-center)
 - [Мультимодальность и Vision (изображения)](#-мультимодальность-и-vision-изображения)
 - [Постоянный сервис на Linux (systemd)](#-постоянный-сервис-на-linux-systemd)
+  - [Troubleshooting: защита от `status=200/CHDIR` (`ProtectHome` / `WorkingDirectory`)](#troubleshooting-защита-от-status200chdir-protecthome--workingdirectory)
 - [Modernized Diagnostics (doctor)](#-modernized-diagnostics-doctor)
 - [Модульная архитектура (`src/`)](#-модульная-архитектура-src)
 - [Windows запуск](#-windows-запуск)
@@ -59,6 +62,7 @@ FreeDeepseekAPI поднимает локальный API-сервер для **
   - [Мультимодальные запросы (OpenAI & Anthropic)](#мультимодальные-запросы-openai--anthropic)
 - [Модели](#-модели)
 - [Endpoints](#-endpoints)
+- [Подключение к Hermes Agent](#-подключение-к-hermes-agent)
 - [Open WebUI](#-open-webui)
 - [Обновить логин](#-обновить-логин)
 - [Тесты](#-тесты)
@@ -95,7 +99,42 @@ FreeDeepseekAPI поднимает локальный API-сервер для **
 
 ## ⚡ Быстрый старт
 
-### 1. Клонирование и Setup Wizard
+### Установка одной командой (Linux & macOS)
+
+Кроссплатформенный установщик автоматически проверит/установит `curl`, `git`, `Node.js >= 18` и `npm`, клонирует или безопасно обновит репозиторий (сохраняя существующие `.env` и `deepseek-auth.json`), выполнит `npm install --omit=dev` и настроит фоновый сервис:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/clockwork-dev/deepseek-free-proxy/main/deploy/quick-install.sh | bash
+```
+
+**Поддерживаемые платформы:**
+- **Linux (`apt`, `dnf`/`yum`, `pacman`, `apk`, `zypper`)**: Debian, Ubuntu, Fedora, RHEL, CentOS, Rocky, AlmaLinux, Arch, Alpine, openSUSE (при версии Node.js в репозитории `< 18` автоматически подтягивается Node 22 LTS).
+  - При активном `systemd` и наличии прав `root`/`sudo` репозиторий ставится в `/opt/deepseek-free-proxy` и регистрируется как сервис `free-deepseek-api.service`.
+  - В окружениях **без systemd** (Docker/LXC контейнеры, WSL2, Alpine OpenRC) автоматически создаются `.env` (`0600`, со сгенерированным `PROXY_API_KEY`) и `deepseek-auth.json` (`{}`) для запуска в foreground.
+- **macOS (`brew`)**: автоматически использует Homebrew, клонирует проект в `~/deepseek-free-proxy` и настраивает `LaunchAgent` (`~/Library/LaunchAgents/com.deepseek.free-proxy.plist`, логи в `~/Library/Logs/deepseek-free-proxy/`).
+  - Перезапуск сервиса на macOS: `launchctl kickstart -k gui/$(id -u)/com.deepseek.free-proxy`
+
+**Неинтерактивный запуск и передача флагов (`bash -s -- ...` или env-переменные):**
+
+```bash
+# Неинтерактивная установка с явным портом и пропуском загрузки браузера
+curl -fsSL https://raw.githubusercontent.com/clockwork-dev/deepseek-free-proxy/main/deploy/quick-install.sh | \
+  bash -s -- --non-interactive --port=9655 --skip-browser
+```
+
+Основные опции `quick-install.sh`:
+- `--install-dir=PATH` (или `INSTALL_DIR=...`) — каталог установки (по умолчанию `/opt/deepseek-free-proxy` для root/Linux systemd или `~/deepseek-free-proxy` для macOS/non-root);
+- `--port=PORT` / `--host=HOST` — адрес и порт прокси (по умолчанию `127.0.0.1:9655`);
+- `--current-user` — запускать systemd-сервис на Linux от текущего пользователя вместо `freedeepseek`;
+- `--user-dir` — установить в `~/deepseek-free-proxy` даже при наличии `sudo`;
+- `--install-browser` / `--skip-browser` — установить или пропустить Chromium Playwright для локальной авторизации;
+- `--skip-service` — выполнить только локальную настройку `.env` без регистрации systemd / LaunchAgent;
+- `--non-interactive`, `-y` (или `NON_INTERACTIVE=1`) — без интерактивных запросов (включается автоматически при отсутствии `/dev/tty`);
+- `--branch=BRANCH` — выбрать ветку Git (по умолчанию `main`).
+
+> 💡 На Windows (MSYS/Git Bash) используйте WSL2 или ручной `git clone` (см. раздел [Windows запуск](#-windows-запуск)).
+
+### 1. Ручное клонирование и Setup Wizard
 ```bash
 git clone https://github.com/clockwork-dev/deepseek-free-proxy.git
 cd deepseek-free-proxy
@@ -186,19 +225,40 @@ Proxy можно запустить как надёжный системный �
 ### 1. Автоматическая установка
 
 ```bash
-# Установка изолированного системного сервиса:
+# Установка изолированного системного сервиса из текущего каталога:
 sudo ./deploy/install.sh
+
+# Установка с копированием проекта в /opt/deepseek-free-proxy (без .git и локальных секретов):
+sudo ./deploy/install.sh --install-dir=/opt/deepseek-free-proxy
 
 # Или запуск от имени текущего пользователя:
 sudo ./deploy/install.sh --current-user
+
+# Неинтерактивная установка с явным портом:
+sudo ./deploy/install.sh --non-interactive --port=9655
 ```
 
+> ℹ️ Файл [`deploy/free-deepseek-api.service`](deploy/free-deepseek-api.service) — это **TEMPLATE ONLY** (шаблон для справки). Всегда используйте `deploy/install.sh` (или `deploy/quick-install.sh`), который динамически генерирует `/etc/systemd/system/free-deepseek-api.service` под ваши пути.
+
 Инсталлятор:
-- Проверяет Node.js (`>=18`);
+- Проверяет Node.js (`>=18`) и вычисляет его реальный путь (`readlink -f`);
 - Создаёт пользователя и группу `freedeepseek` (при стандартной установке);
-- Создаёт защищённую директорию конфигурации `/etc/free-deepseek-api/` с правами `0750`;
-- Генерирует криптографически стойкий `proxy-api-key` с правами `0640`;
-- Регистрирует unit `free-deepseek-api.service` в systemd с изоляцией `NoNewPrivileges=yes` и `ProtectSystem=full`.
+- Выполняет pre-flight проверку прав пользователя `$SERVICE_USER` на обход и чтение `$PROJECT_DIR`, `server.js`, `$NODE_BIN` и файлов секретов до старта systemd;
+- Создаёт защищённую директорию конфигурации `/etc/free-deepseek-api/` с `umask 077` и правами `0750`;
+- Генерирует криптографически стойкий `proxy-api-key` (`0640`) и валидный JSON placeholder `{}` в `/etc/free-deepseek-api/deepseek-auth.json` (`0600`), если аккаунт ещё не импортирован;
+- Регистрирует unit `free-deepseek-api.service` с динамическими `WorkingDirectory=$PROJECT_DIR`, `ExecStart`, `NoNewPrivileges=true`, `ProtectSystem=strict` и адаптивным `ProtectHome`;
+- После запуска автоматически проверяет `systemctl is-active` и `GET /health` (при ошибке печатает последние 20 строк `journalctl -u free-deepseek-api -n 20`).
+
+### Troubleshooting: защита от `status=200/CHDIR` (`ProtectHome` / `WorkingDirectory`)
+
+В старых шаблонах systemd ошибка **`status=200/CHDIR`** (или `203/EXEC`) возникала по двум причинам:
+1. Статичный `WorkingDirectory` (например, несуществующий `/opt/FreeDeepseekAPI`) или запуск из домашнего каталога с правами `0700` под пользователем `freedeepseek`.
+2. Жёсткий `ProtectHome=true`: эта директива полностью скрывает `/home` и `/root` от процесса сервиса. Если код проекта, бинарник Node.js (`nvm`/`fnm`/`volta` в `~/.nvm`), `DEEPSEEK_AUTH_PATH` или `PROXY_API_KEY_FILE` находятся в `/home` или `/root`, systemd не сможет перейти в `WorkingDirectory` и завершится с `status=200/CHDIR`.
+
+**Как это решается автоматически в `deploy/install.sh`:**
+- `WorkingDirectory` всегда выставляется динамически на фактический `$PROJECT_DIR` (либо `/opt/deepseek-free-proxy` при `--install-dir`).
+- В режиме по умолчанию `--protect-home=auto` инсталлятор проверяет `$PROJECT_DIR`, `$NODE_BIN` (включая симлинки через `readlink -f`), `$CONFIG_DIR`, `$ENV_FILE`, `$PROXY_API_KEY_FILE` и пути `DEEPSEEK_AUTH_PATH`/`DEEPSEEK_AUTH_DIR`. Если любой из них находится внутри `/home` или `/root`, автоматически выставляется `ProtectHome=read-only` вместо `ProtectHome=true` (при необходимости можно переопределить через `--protect-home=true|read-only|false`).
+- Перед запуском службы выполняется pre-flight проверка прав от имени `$SERVICE_USER` с точным указанием блокирующего родительского каталога (например, `0700` на `/home/user`) и выбором решения (`--install-dir=/opt/deepseek-free-proxy` или `--current-user`).
 
 ### 2. Управление службой через CLI
 
@@ -293,8 +353,10 @@ npm run doctor -- --json
 │   ├── auth.js                # Interactive Chrome login capture
 │   └── auth_import.js         # CLI import for cookies and tokens
 └── deploy/
-    ├── install.sh             # Linux systemd automated installer
-    └── uninstall.sh           # Clean service uninstaller
+    ├── quick-install.sh          # Cross-platform one-line installer (Linux & macOS)
+    ├── install.sh                # Linux systemd automated installer (adaptive ProtectHome)
+    ├── uninstall.sh              # Clean service uninstaller (systemd & LaunchAgent)
+    └── free-deepseek-api.service # Reference systemd unit template (TEMPLATE ONLY)
 ```
 
 ---
@@ -665,6 +727,50 @@ print(response.choices[0].message.content)
 
 ---
 
+## 🤖 Подключение к Hermes Agent
+
+Hermes Agent поддерживает подключение FreeDeepseekAPI как custom OpenAI-compatible endpoint в `~/.hermes/config.yaml` (используйте значение `PROXY_API_KEY` из `.env` или `/etc/free-deepseek-api/proxy-api-key` при systemd-установке).
+
+### Вариант 1 — Прямая настройка в секции `model:` (самый простой)
+
+```yaml
+model:
+  default: "deepseek-chat"
+  provider: "custom"
+  base_url: "http://127.0.0.1:9655/v1"
+  api_key: "YOUR_PROXY_API_KEY"
+  api_mode: "chat_completions"
+```
+
+> 💡 Чтобы не хранить ключ в `config.yaml`, удалите строку `api_key:` и укажите `key_env: "DEEPSEEK_PROXY_API_KEY"`, а сам ключ пропишите в `~/.hermes/.env`: `DEEPSEEK_PROXY_API_KEY=YOUR_PROXY_API_KEY`.
+
+### Вариант 2 — Именованный провайдер в `providers:` (выбор моделей через `/model` и Dashboard)
+
+```yaml
+providers:
+  free-deepseek:
+    name: "FreeDeepseekAPI"
+    base_url: "http://127.0.0.1:9655/v1"
+    api_key: "YOUR_PROXY_API_KEY"
+    api_mode: "chat_completions"
+    default_model: "deepseek-chat"
+    models:
+      - "deepseek-chat"
+      - "deepseek-chat-search"
+      - "deepseek-reasoner"
+      - "deepseek-reasoner-search"
+
+model:
+  default: "deepseek-chat"
+  provider: "free-deepseek"
+  base_url: "http://127.0.0.1:9655/v1"
+  api_mode: "chat_completions"
+```
+
+> ⚠️ **Важно:** не задавайте `provider: "deepseek"` — встроенная нормализация Hermes (`hermes_cli/model_normalize.py`) при `provider == "deepseek"` переписывает имя модели `deepseek-chat` в `deepseek-flash`. Используйте `provider: "custom"` или именованную запись в `providers:`, чтобы имя модели передавалось без изменений.
+
+---
+
 ## 🖥 Open WebUI
 
 Base URL для подключения в Open WebUI:
@@ -694,7 +800,7 @@ npm run auth
 
 ## 🧪 Тесты
 
-Проект содержит всесторонний набор из **155 тестов**, проверяющих синтаксис, архитектуру, безопасность, мультимодальность и CLI:
+Проект содержит всесторонний набор из **165 тестов**, проверяющих синтаксис, архитектуру, безопасность, установщики, мультимодальность и CLI:
 
 ```bash
 npm test
@@ -704,14 +810,15 @@ npm test
 ```text
 ✔ cli tests (help, version, non-interactive, doctor, setup)
 ✔ doctor diagnostics tests (Node check, browser resolution, auth validation, json output)
+✔ install & systemd tests (bash -n, adaptive ProtectHome, quick-install OS/distro & macOS LaunchAgent, env security)
 ✔ multimodal engine tests (magic byte sniffing, SSRF protection, LRU cache TTL, concurrent uploads)
 ✔ tool parser tests (DSML parsing, code fences, lenient JSON repair, schema compaction)
 ✔ account pool tests (round-robin selection, sticky sessions, cooldown handling)
 ✔ security tests (token leakage prevention, zero watermarks, CORS, SSRF guards)
 ✔ integration & unit tests (streaming, session reuse, mock server e2e)
 
-ℹ tests 155
-ℹ pass 155
+ℹ tests 165
+ℹ pass 165
 ℹ fail 0
 ```
 
