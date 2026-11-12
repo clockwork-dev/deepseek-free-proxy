@@ -1,6 +1,6 @@
 const fs = require('fs');
 const crypto = require('crypto');
-const { isTruthy } = require('../utils/auth');
+const { isTruthy, isLoopbackHost } = require('../utils/auth');
 
 function envNumber(name, fallback, min = 0) {
     const val = Number(process.env[name]);
@@ -18,6 +18,10 @@ const MAX_IMAGES_PER_REQUEST = Math.floor(envNumber('DEEPSEEK_MAX_IMAGES', 4, 1)
 const MAX_IMAGE_BYTES = Math.floor(envNumber('DEEPSEEK_MAX_IMAGE_BYTES', 7 * 1024 * 1024, 1024));
 const DS_FILE_TIMEOUT_MS = envNumber('DEEPSEEK_FILE_TIMEOUT_MS', 60000, 1000);
 const DS_FILE_POLL_MS = envNumber('DEEPSEEK_FILE_POLL_MS', 1000, 50);
+const REMOTE_IMAGE_FETCH_TIMEOUT_MS = envNumber('DEEPSEEK_IMAGE_FETCH_TIMEOUT_MS', 15000, 1000);
+const UPLOADED_FILE_TTL_MS = envNumber('DEEPSEEK_FILE_CACHE_TTL_MS', 30 * 60 * 1000, 1000);
+const UPLOADED_FILE_CACHE_MAX = Math.floor(envNumber('DEEPSEEK_FILE_CACHE_MAX', 256, 1));
+
 const COMPLETION_PATH = '/api/v0/chat/completion';
 const FILE_UPLOAD_PATH = '/api/v0/file/upload_file';
 
@@ -33,12 +37,248 @@ function describeAttachment(kind, reference) {
     return `[${kind}: ${value}]`;
 }
 
+/**
+ * Robust in-memory LRU Cache with TTL and statistics.
+ * Extends Map compatibility for drop-in usage across tests and code.
+ */
+class ImageUploadCache {
+    constructor(maxEntries = UPLOADED_FILE_CACHE_MAX, defaultTtlMs = UPLOADED_FILE_TTL_MS) {
+        this.maxEntries = maxEntries;
+        this.defaultTtlMs = defaultTtlMs;
+        this.map = new Map();
+        this.stats = { hits: 0, misses: 0, evictions: 0 };
+    }
+
+    get(key) {
+        const entry = this.map.get(key);
+        if (!entry) {
+            this.stats.misses++;
+            return null;
+        }
+        if (Date.now() - entry.at > entry.ttlMs) {
+            this.map.delete(key);
+            this.stats.misses++;
+            return null;
+        }
+        // Move to most recently used position
+        this.map.delete(key);
+        this.map.set(key, entry);
+        this.stats.hits++;
+        return entry.id;
+    }
+
+    set(key, id, ttlMs = this.defaultTtlMs) {
+        if (this.map.has(key)) {
+            this.map.delete(key);
+        }
+        this.map.set(key, { id, at: Date.now(), ttlMs });
+        while (this.map.size > this.maxEntries) {
+            const oldestKey = this.map.keys().next().value;
+            this.map.delete(oldestKey);
+            this.stats.evictions++;
+        }
+        return this;
+    }
+
+    has(key) {
+        return this.get(key) !== null;
+    }
+
+    delete(key) {
+        return this.map.delete(key);
+    }
+
+    clear() {
+        this.map.clear();
+        this.stats = { hits: 0, misses: 0, evictions: 0 };
+    }
+
+    _purgeExpired() {
+        const now = Date.now();
+        for (const [key, entry] of this.map.entries()) {
+            if (now - entry.at > entry.ttlMs) {
+                this.map.delete(key);
+            }
+        }
+    }
+
+    get size() {
+        this._purgeExpired();
+        return this.map.size;
+    }
+
+    keys() {
+        this._purgeExpired();
+        return this.map.keys();
+    }
+
+    values() {
+        this._purgeExpired();
+        return Array.from(this.map.values()).map(e => e.id);
+    }
+
+    entries() {
+        this._purgeExpired();
+        return Array.from(this.map.entries()).map(([k, e]) => [k, e.id]);
+    }
+
+    [Symbol.iterator]() {
+        return this.entries()[Symbol.iterator]();
+    }
+}
+
+const uploadedFileCache = new ImageUploadCache();
+
+function getCachedUpload(key) {
+    return uploadedFileCache.get(key);
+}
+
+function setCachedUpload(key, id) {
+    uploadedFileCache.set(key, id);
+}
+
+/**
+ * Detect image MIME type by inspecting magic header bytes.
+ */
+function detectMimeType(buffer) {
+    if (!buffer || buffer.length < 4) return null;
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (buffer.length >= 8 &&
+        buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47 &&
+        buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a) {
+        return 'image/png';
+    }
+    // JPEG: FF D8 FF
+    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+        return 'image/jpeg';
+    }
+    // GIF: 47 49 46 38 (GIF87a / GIF89a)
+    if (buffer.length >= 6 &&
+        buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) {
+        return 'image/gif';
+    }
+    // WebP: RIFF .... WEBP
+    if (buffer.length >= 12 &&
+        buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+        buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) {
+        return 'image/webp';
+    }
+    // BMP: 42 4D
+    if (buffer[0] === 0x42 && buffer[1] === 0x4d) {
+        return 'image/bmp';
+    }
+    return null;
+}
+
+function isSupportedVisionMime(mime) {
+    return /^image\/(?:png|jpe?g|webp|gif)$/i.test(String(mime || ''));
+}
+
+/**
+ * SSRF validation: check if a hostname is private or loopback.
+ */
+function isPrivateHost(hostname) {
+    const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+    if (isLoopbackHost(host)) return true;
+    // IPv4 private ranges
+    if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2[0-9]|3[01])\./.test(host) || /^169\.254\./.test(host)) {
+        return true;
+    }
+    // IPv6 unique local / link local
+    if (/^fe80:/i.test(host) || /^fc00:/i.test(host) || /^fd[0-9a-f]{2}:/i.test(host)) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Fetch remote image URL with timeout, bounds checking, and MIME detection.
+ */
+async function fetchRemoteImage(url, { signal, timeoutMs = REMOTE_IMAGE_FETCH_TIMEOUT_MS, maxBytes = MAX_IMAGE_BYTES, allowPrivate = false } = {}) {
+    if (!url || typeof url !== 'string') return null;
+    let parsed;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return null;
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return null;
+    }
+
+    if (!allowPrivate && isPrivateHost(parsed.hostname)) {
+        console.warn(`[multimodal] SSRF protection blocked remote image fetch to private host: ${parsed.hostname}`);
+        return null;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`Timeout fetching remote image after ${timeoutMs}ms`)), timeoutMs);
+    const combinedSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+
+    try {
+        const resp = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (compatible; DeepSeekProxy/1.0; +https://github.com/deepseek-free-proxy)',
+                'Accept': 'image/png,image/jpeg,image/webp,image/gif,*/*;q=0.8',
+            },
+            signal: combinedSignal,
+        });
+
+        if (!resp.ok) {
+            console.warn(`[multimodal] Remote image fetch failed: HTTP ${resp.status} for ${url}`);
+            return null;
+        }
+
+        const contentLength = Number(resp.headers.get('content-length'));
+        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+            console.warn(`[multimodal] Remote image ${url} content-length (${contentLength}) exceeds limit of ${maxBytes} bytes`);
+            return null;
+        }
+
+        const arrayBuffer = await resp.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        if (buffer.length === 0) return null;
+        if (buffer.length > maxBytes) {
+            console.warn(`[multimodal] Remote image ${url} (${buffer.length} bytes) exceeds limit of ${maxBytes} bytes`);
+            return null;
+        }
+
+        let mime = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        const detectedMime = detectMimeType(buffer);
+        if (detectedMime && (!isSupportedVisionMime(mime) || mime === 'application/octet-stream' || mime === 'binary/octet-stream')) {
+            mime = detectedMime;
+        }
+
+        if (!isSupportedVisionMime(mime)) {
+            console.warn(`[multimodal] Unsupported image MIME "${mime}" for remote image ${url}`);
+            return null;
+        }
+
+        const hash = crypto.createHash('sha256').update(buffer).digest('hex').substring(0, 12);
+        const extension = (mime.split('/')[1] || 'png').replace(/[^\w]/g, '').substring(0, 8) || 'png';
+        return {
+            mime,
+            data: buffer,
+            hash,
+            filename: `image-${hash}.${extension}`,
+            url,
+        };
+    } catch (err) {
+        console.warn(`[multimodal] Failed to fetch remote image ${url}: ${err.message}`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 const decodedImageCache = new WeakMap();
 
 // Inline image of a content part (OpenAI image_url / Responses input_image
 // data URLs, Anthropic base64 sources) as { mime, data, hash, filename }, or
 // null for remote URLs and anything that is not a usable image.
-function decodeImagePart(part) {
+function decodeImagePart(part, maxBytes = MAX_IMAGE_BYTES) {
     if (!part || typeof part !== 'object') return null;
     if (decodedImageCache.has(part)) return decodedImageCache.get(part);
     let mime = '';
@@ -55,14 +295,25 @@ function decodeImagePart(part) {
         }
     }
     let image = null;
-    // Formats DeepSeek's image understanding accepts; anything else (SVG, ...)
-    // stays a text marker instead of failing the whole request.
-    if (/^image\/(?:png|jpe?g|webp|gif)$/i.test(mime) && base64) {
+    if (base64) {
         const data = Buffer.from(base64.replace(/\s+/g, ''), 'base64');
-        if (data.length > 0 && data.length <= MAX_IMAGE_BYTES) {
-            const hash = crypto.createHash('sha256').update(data).digest('hex').substring(0, 12);
-            const extension = (mime.split('/')[1] || 'png').replace(/[^\w]/g, '').substring(0, 8) || 'png';
-            image = { mime, data, hash, filename: `image-${hash}.${extension}` };
+        const detectedMime = detectMimeType(data);
+        if (detectedMime && !isSupportedVisionMime(mime)) {
+            mime = detectedMime;
+        }
+
+        // Formats DeepSeek's image understanding accepts; anything else (SVG, ...)
+        // stays a text marker instead of failing the whole request.
+        if (isSupportedVisionMime(mime)) {
+            if (data.length > 0) {
+                if (data.length <= maxBytes) {
+                    const hash = crypto.createHash('sha256').update(data).digest('hex').substring(0, 12);
+                    const extension = (mime.split('/')[1] || 'png').replace(/[^\w]/g, '').substring(0, 8) || 'png';
+                    image = { mime, data, hash, filename: `image-${hash}.${extension}` };
+                } else {
+                    console.warn(`[multimodal] Inline image (${data.length} bytes) exceeds limit of ${maxBytes} bytes; gracefully omitted.`);
+                }
+            }
         }
     }
     decodedImageCache.set(part, image);
@@ -70,6 +321,7 @@ function decodeImagePart(part) {
 }
 
 function hasInlineImageData(part) {
+    if (!part || typeof part !== 'object') return false;
     if (part.type === 'image') return part.source?.type === 'base64';
     const url = part.image_url?.url ?? part.image_url ?? part.url;
     return typeof url === 'string' && /^data:/i.test(url);
@@ -109,6 +361,49 @@ function collectImages(messages, limit = MAX_IMAGES_PER_REQUEST) {
     return images.slice(-limit);
 }
 
+/**
+ * Collect images with asynchronous remote URL prefetching and resolution.
+ */
+async function collectImagesAsync(messages, limit = MAX_IMAGES_PER_REQUEST, opts = {}) {
+    const remoteTasks = [];
+
+    const visit = (content) => {
+        if (!Array.isArray(content)) return;
+        for (const part of content) {
+            if (!part || typeof part !== 'object') continue;
+            if (part.type === 'tool_result') { visit(part.content); continue; }
+            if (decodedImageCache.has(part)) continue;
+
+            let remoteUrl = null;
+            if (part.type === 'image_url' || part.type === 'input_image') {
+                const u = part.image_url?.url ?? part.image_url ?? part.url;
+                if (typeof u === 'string' && /^https?:\/\//i.test(u)) remoteUrl = u;
+            } else if (part.type === 'image' && part.source?.type === 'url') {
+                const u = part.source.url;
+                if (typeof u === 'string' && /^https?:\/\//i.test(u)) remoteUrl = u;
+            }
+
+            if (remoteUrl) {
+                remoteTasks.push(
+                    fetchRemoteImage(remoteUrl, opts).then(img => {
+                        if (img) decodedImageCache.set(part, img);
+                    })
+                );
+            }
+        }
+    };
+
+    for (const msg of messages || []) {
+        if (msg && !isSystemRole(msg.role)) visit(msg.content);
+    }
+
+    if (remoteTasks.length > 0) {
+        await Promise.allSettled(remoteTasks);
+    }
+
+    return collectImages(messages, limit);
+}
+
 function normalizeMessageContent(content) {
     if (content === null || content === undefined) return '';
     if (typeof content === 'string') return content;
@@ -133,25 +428,6 @@ function normalizeMessageContent(content) {
         }).filter(Boolean).join('\n');
     }
     return String(content);
-}
-
-// Uploaded file ids per `account:imageHash`, shared across requests: a turn
-// that starts a new chat must not upload the same images again.
-const UPLOADED_FILE_TTL_MS = 30 * 60 * 1000;
-const UPLOADED_FILE_CACHE_MAX = 256;
-const uploadedFileCache = new Map();
-
-function getCachedUpload(key) {
-    const entry = uploadedFileCache.get(key);
-    if (!entry) return null;
-    if (Date.now() - entry.at > UPLOADED_FILE_TTL_MS) { uploadedFileCache.delete(key); return null; }
-    return entry.id;
-}
-
-function setCachedUpload(key, id) {
-    uploadedFileCache.delete(key);
-    uploadedFileCache.set(key, { id, at: Date.now() });
-    while (uploadedFileCache.size > UPLOADED_FILE_CACHE_MAX) uploadedFileCache.delete(uploadedFileCache.keys().next().value);
 }
 
 // Status of one uploaded file in a fetch_files response. Read defensively:
@@ -230,28 +506,32 @@ async function uploadImageToDeepSeek(account, image, signal, deadlineAt = Infini
     return fileId;
 }
 
-// Uploads the images of a request once per account (files belong to the
-// account that uploaded them).
+// Uploads the images of a request concurrently per account using Promise.all
+// and LRU caching (files belong to the account that uploaded them).
 async function uploadImagesForAccount(account, images, signal, agentTag, deadlineAt = Infinity) {
     if (!images || images.length === 0) return [];
-    const ids = [];
-    let uploaded = 0;
     try {
-        for (const image of images) {
+        const uploadTasks = images.map(async (image) => {
             const key = `${account.id}:${image.hash}`;
             let id = getCachedUpload(key);
-            if (!id) {
-                // Uploads count against the request's overall deadline.
-                if (Date.now() > deadlineAt) {
-                    const { timeoutError } = require('./client');
-                    throw timeoutError('Request deadline reached while uploading images');
-                }
-                id = await uploadImageToDeepSeek(account, image, signal, deadlineAt);
-                setCachedUpload(key, id);
-                uploaded++;
+            if (id) {
+                return { id, uploaded: false };
             }
-            ids.push(id);
+            if (Date.now() > deadlineAt) {
+                const { timeoutError } = require('./client');
+                throw timeoutError('Request deadline reached while uploading images');
+            }
+            id = await uploadImageToDeepSeek(account, image, signal, deadlineAt);
+            setCachedUpload(key, id);
+            return { id, uploaded: true };
+        });
+
+        const results = await Promise.all(uploadTasks);
+        const uploadedCount = results.filter(r => r.uploaded).length;
+        if (uploadedCount && agentTag) {
+            console.log(`${agentTag} Uploaded ${uploadedCount} image(s) to DeepSeek concurrently`);
         }
+        return results.map(r => r.id);
     } catch (error) {
         const { isAccountLevelError } = require('../accounts/pool');
         const { isTimeoutError } = require('./client');
@@ -261,8 +541,6 @@ async function uploadImagesForAccount(account, images, signal, agentTag, deadlin
         failure.type = 'image_upload_failed';
         throw failure;
     }
-    if (uploaded) console.log(`${agentTag} Uploaded ${uploaded} image(s) to DeepSeek`);
-    return ids;
 }
 
 // Extract MEDIA: paths for screenshots produced during the current turn, so a
@@ -310,11 +588,17 @@ module.exports = {
     MAX_IMAGE_BYTES,
     DS_FILE_TIMEOUT_MS,
     DS_FILE_POLL_MS,
+    REMOTE_IMAGE_FETCH_TIMEOUT_MS,
     COMPLETION_PATH,
     FILE_UPLOAD_PATH,
     uploadedFileCache,
+    ImageUploadCache,
     getCachedUpload,
     setCachedUpload,
+    detectMimeType,
+    isSupportedVisionMime,
+    isPrivateHost,
+    fetchRemoteImage,
     extractUploadedFileStatus,
     throwIfImageBusinessRateLimited,
     uploadImageToDeepSeek,
@@ -325,7 +609,10 @@ module.exports = {
     hasInlineImageData,
     describeImagePart,
     collectImages,
+    collectImagesAsync,
     normalizeMessageContent,
     extractScreenshotPaths,
     isSystemRole,
+    FILE_READY_STATUS,
+    FILE_FAILED_STATUS,
 };

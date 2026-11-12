@@ -17,6 +17,7 @@ const {
 const {
     IMAGE_UPLOAD_ENABLED,
     collectImages,
+    collectImagesAsync,
     normalizeMessageContent,
     extractScreenshotPaths,
 } = require('../deepseek/multimodal');
@@ -285,8 +286,8 @@ function handleChat(req, res, url, state = {}) {
             // Images: the new messages' images go into a reused chat, the
             // conversation's most recent images into a new chat.
             const attachments = IMAGE_UPLOAD_ENABLED ? {
-                delta: plan.mode === 'delta' ? collectImages(plan.messages) : [],
-                full: collectImages(messages),
+                delta: plan.mode === 'delta' ? await collectImagesAsync(plan.messages) : [],
+                full: await collectImagesAsync(messages),
                 deadlineAt: requestStartedAt + REQUEST_DEADLINE_MS,
             } : null;
 

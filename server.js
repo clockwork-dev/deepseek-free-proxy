@@ -38,7 +38,11 @@ const {
 const {
     imageUploadEnabled,
     uploadedFileCache,
+    ImageUploadCache,
     collectImages,
+    collectImagesAsync,
+    fetchRemoteImage,
+    detectMimeType,
     normalizeMessageContent,
     extractScreenshotPaths,
 } = require('./src/deepseek/multimodal');
@@ -138,6 +142,10 @@ const serverInternals = {
     normalizeApiParams,
     extractScreenshotPaths,
     collectImages,
+    collectImagesAsync,
+    fetchRemoteImage,
+    detectMimeType,
+    ImageUploadCache,
     uploadedFileCache,
     isRateLimitError,
     imageUploadEnabled,
