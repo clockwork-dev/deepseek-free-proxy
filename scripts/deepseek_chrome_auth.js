@@ -284,7 +284,7 @@ async function readPageAuth(cdp) {
 
     const cookieRes = await cdp.send('Network.getAllCookies');
     const cookies = (cookieRes.cookies || []).filter((c) =>
-        /deepseek\.com$/.test(c.domain),
+        /(^|\.)deepseek\.com$/i.test(String(c.domain || '').trim()),
     );
     const cookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
 

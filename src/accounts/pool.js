@@ -51,14 +51,19 @@ function discoverAuthPaths() {
             return [];
         }
     }
-    if (process.env.DEEPSEEK_AUTH_PATH && process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
-        return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+    if (process.env.DEEPSEEK_AUTH_PATH) {
+        if (process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
+            return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        if (process.env.DEEPSEEK_AUTH_PATH.trim()) {
+            return [process.env.DEEPSEEK_AUTH_PATH.trim()];
+        }
     }
     return [DS_CONFIG_PATH];
 }
 
 function loadDeepSeekConfig({ fatal = true } = {}) {
-    loadDotEnv();
+    loadDotEnv(path.join(ROOT_DIR, '.env'));
     accounts.length = 0;
     const paths = discoverAuthPaths();
     for (const file of paths) {

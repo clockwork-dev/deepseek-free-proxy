@@ -4,6 +4,9 @@ const readline = require('readline');
 const { spawnSync } = require('child_process');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
+if (require.main === module) {
+    require('../lib/env').loadDotEnv(path.join(ROOT_DIR, '.env'));
+}
 
 const {
     PORT,
@@ -51,7 +54,14 @@ const server = http.createServer(async (req, res) => {
     setCorsResponseHeaders(res);
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    let url;
+    try {
+        url = new URL(req.url || '/', 'http://localhost');
+    } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Malformed request URL', type: 'invalid_request_error' } }));
+        return;
+    }
     const isPublicProbe = req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health' || url.pathname === '/readyz');
     if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization, PROXY_API_KEY, req.headers['x-api-key'])) {
         res.writeHead(401, {

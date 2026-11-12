@@ -14,8 +14,9 @@ const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 const { loadDotEnv } = require('../lib/env');
+const { defaultAuthOutputPath } = require('./auth_import');
 const { resolveChromePath, ensureBrowser } = require('./ensure_browser');
-const { runDoctor, printReport } = require('./doctor');
+const { runDoctor, printReport, isSystemdAvailable, formatProbeHost } = require('./doctor');
 
 const ROOT = path.resolve(__dirname, '..');
 loadDotEnv(path.join(ROOT, '.env'));
@@ -41,7 +42,7 @@ function banner() {
   console.log('  1. Network and security settings (.env)');
   console.log('  2. Browser engine for DeepSeek authentication');
   console.log('  3. DeepSeek Web account credentials capture');
-  console.log('  4. Linux systemd service installation (optional)');
+  console.log('  4. Background service installation (Linux systemd)');
   console.log('  5. Diagnostic health check');
   console.log(`${c.cyan}------------------------------------------------------${c.reset}\n`);
 }
@@ -49,9 +50,14 @@ function banner() {
 function ask(rl, question, defaultValue = '') {
   const promptText = defaultValue ? `${question} [${defaultValue}]: ` : `${question}: `;
   return new Promise(resolve => {
+    let answered = false;
     rl.question(promptText, ans => {
+      answered = true;
       const val = ans.trim();
       resolve(val || defaultValue);
+    });
+    rl.once('close', () => {
+      if (!answered) resolve(defaultValue);
     });
   });
 }
@@ -59,14 +65,27 @@ function ask(rl, question, defaultValue = '') {
 function askYesNo(rl, question, defaultYes = true) {
   const defaultLabel = defaultYes ? 'Y/n' : 'y/N';
   return new Promise(resolve => {
+    let answered = false;
     rl.question(`${question} [${defaultLabel}]: `, ans => {
+      answered = true;
       const val = ans.trim().toLowerCase();
       if (!val) return resolve(defaultYes);
       if (val === 'y' || val === 'yes' || val === '1' || val === 'true') return resolve(true);
       if (val === 'n' || val === 'no' || val === '0' || val === 'false') return resolve(false);
       return resolve(defaultYes);
     });
+    rl.once('close', () => {
+      if (!answered) resolve(defaultYes);
+    });
   });
+}
+
+function sanitizeEnvValue(val) {
+  const s = String(val);
+  if (/[\r\n\0]/.test(s)) {
+    throw new Error('Environment variable values must not contain newline or NUL characters.');
+  }
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 function updateEnvFile(envPath, updates) {
@@ -82,16 +101,33 @@ function updateEnvFile(envPath, updates) {
 
   for (const [key, val] of Object.entries(updates)) {
     if (val === undefined || val === null) continue;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new Error(`Invalid environment variable key: ${key}`);
+    }
     const regex = new RegExp(`^(?:export\\s+)?${key}\\s*=.*$`, 'm');
-    const newLine = `${key}="${val}"`;
+    const escaped = sanitizeEnvValue(val);
+    const newLine = `${key}="${escaped}"`;
     if (regex.test(content)) {
-      content = content.replace(regex, newLine);
+      content = content.replace(regex, () => newLine);
     } else {
       content = (content ? content.trimEnd() + '\n' : '') + `${newLine}\n`;
     }
   }
 
-  fs.writeFileSync(envPath, content, 'utf8');
+  fs.writeFileSync(envPath, content, { encoding: 'utf8', mode: 0o600 });
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(envPath, 0o600); } catch {}
+  }
+}
+
+function hasPopulatedAuth(file) {
+  try {
+    if (!fs.existsSync(file)) return false;
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Boolean(parsed && typeof parsed === 'object' && parsed.token && parsed.cookie);
+  } catch {
+    return false;
+  }
 }
 
 function parseArgs(args = process.argv.slice(2)) {
@@ -99,7 +135,7 @@ function parseArgs(args = process.argv.slice(2)) {
     nonInteractive: false,
     port: '',
     host: '',
-    apiKey: '',
+    apiKey: undefined,
     installBrowser: false,
     skipBrowser: false,
     installService: false,
@@ -116,11 +152,11 @@ function parseArgs(args = process.argv.slice(2)) {
     else if (a === '--install-service') options.installService = true;
     else if (a === '--skip-service') options.skipService = true;
     else if (a.startsWith('--port=')) options.port = a.slice(7);
-    else if (a === '--port' && args[i + 1]) options.port = args[++i];
+    else if (a === '--port' && args[i + 1] !== undefined) options.port = args[++i];
     else if (a.startsWith('--host=')) options.host = a.slice(7);
-    else if (a === '--host' && args[i + 1]) options.host = args[++i];
+    else if (a === '--host' && args[i + 1] !== undefined) options.host = args[++i];
     else if (a.startsWith('--api-key=')) options.apiKey = a.slice(10);
-    else if (a === '--api-key' && args[i + 1]) options.apiKey = args[++i];
+    else if (a === '--api-key' && args[i + 1] !== undefined) options.apiKey = args[++i];
     else if (a === '--help' || a === '-h') options.help = true;
   }
 
@@ -143,7 +179,7 @@ async function runSetupWizard(options = {}) {
     // ------------------------------------------------------------------
     const currentPort = options.port || process.env.PORT || '9655';
     const currentHost = options.host || process.env.HOST || '127.0.0.1';
-    let currentApiKey = options.apiKey !== undefined ? options.apiKey : (process.env.PROXY_API_KEY || '');
+    const currentApiKey = options.apiKey !== undefined ? options.apiKey : (process.env.PROXY_API_KEY || '');
 
     let chosenPort = currentPort;
     let chosenHost = currentHost;
@@ -180,7 +216,10 @@ async function runSetupWizard(options = {}) {
       PROXY_API_KEY: chosenApiKey,
     };
     updateEnvFile(envPath, envUpdates);
-    loadDotEnv(envPath);
+    // Reflect saved values in current process.env
+    process.env.PORT = chosenPort;
+    process.env.HOST = chosenHost;
+    process.env.PROXY_API_KEY = chosenApiKey;
     console.log(`\n  ${c.green}✔ Configuration saved to ${envPath}${c.reset}`);
 
     // ------------------------------------------------------------------
@@ -218,13 +257,13 @@ async function runSetupWizard(options = {}) {
     // Step 3: DeepSeek Account Credentials
     // ------------------------------------------------------------------
     console.log(`\n${c.bold}[4/5] DeepSeek Account Authentication${c.reset}`);
-    const authFile = process.env.DEEPSEEK_AUTH_PATH || path.join(ROOT, 'deepseek-auth.json');
-    const authExists = fs.existsSync(authFile);
+    const authFile = defaultAuthOutputPath(process.env, ROOT);
+    const authReady = hasPopulatedAuth(authFile);
 
-    if (authExists) {
+    if (authReady) {
       console.log(`  ${c.green}✔ Account credentials file detected:${c.reset} ${authFile}`);
     } else {
-      console.log(`  ${c.yellow}⚠️ No credentials found at ${authFile}.${c.reset}`);
+      console.log(`  ${c.yellow}⚠️ No valid credentials found at ${authFile}.${c.reset}`);
       let shouldRunLogin = false;
       if (!nonInteractive && rl && browserPath) {
         shouldRunLogin = await askYesNo(
@@ -243,35 +282,47 @@ async function runSetupWizard(options = {}) {
     }
 
     // ------------------------------------------------------------------
-    // Step 4: Systemd Service Installation (Linux)
+    // Step 4: Systemd Service Installation (Linux with active systemd)
     // ------------------------------------------------------------------
     if (process.platform === 'linux') {
       console.log(`\n${c.bold}[5/5] Linux Systemd Service Setup${c.reset}`);
-      const unitPath = '/etc/systemd/system/free-deepseek-api.service';
-      if (fs.existsSync(unitPath)) {
-        console.log(`  ${c.green}✔ free-deepseek-api.service is already installed.${c.reset}`);
+      if (!isSystemdAvailable()) {
+        console.log(`  ${c.dim}systemd is not active in this environment (container/WSL/alternate init); skipping service setup.${c.reset}`);
+        console.log(`  ${c.dim}Run proxy in foreground with: NON_INTERACTIVE=1 npm start${c.reset}`);
       } else {
-        let shouldInstallService = options.installService;
-        if (!nonInteractive && !options.skipService && rl) {
-          shouldInstallService = await askYesNo(
-            rl,
-            'Install FreeDeepseekAPI as a background systemd service now?',
-            false
-          );
-        }
-        if (shouldInstallService) {
-          console.log('  Running service installer with sudo...');
-          const installScript = path.join(ROOT, 'deploy', 'install.sh');
-          const res = spawnSync('sudo', [installScript, '--current-user', `--port=${chosenPort}`, '--non-interactive'], {
-            stdio: 'inherit',
-          });
-          if (res.status === 0) {
-            console.log(`  ${c.green}✔ Systemd service installed and started!${c.reset}`);
-          } else {
-            console.log(`  ${c.yellow}⚠️ Service installer exited with code ${res.status}. You can run 'sudo ./deploy/install.sh' manually.${c.reset}`);
-          }
+        const unitPath = '/etc/systemd/system/free-deepseek-api.service';
+        if (fs.existsSync(unitPath)) {
+          console.log(`  ${c.green}✔ free-deepseek-api.service is already installed.${c.reset}`);
         } else {
-          console.log(`  ${c.dim}Skipped systemd installation. (To install later: sudo ./deploy/install.sh)${c.reset}`);
+          let shouldInstallService = options.installService;
+          if (!nonInteractive && !options.skipService && rl) {
+            shouldInstallService = await askYesNo(
+              rl,
+              'Install FreeDeepseekAPI as a background systemd service now?',
+              false
+            );
+          }
+          if (shouldInstallService) {
+            const installScript = path.join(ROOT, 'deploy', 'install.sh');
+            const installArgs = [installScript, '--current-user', `--port=${chosenPort}`, `--host=${chosenHost}`, '--non-interactive'];
+            const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+            let res;
+            if (isRoot) {
+              console.log('  Running service installer as root...');
+              res = spawnSync('bash', installArgs, { stdio: 'inherit', env: process.env });
+            } else {
+              console.log('  Running service installer with sudo...');
+              res = spawnSync('sudo', ['bash', ...installArgs], { stdio: 'inherit', env: process.env });
+            }
+            if (res.status === 0) {
+              console.log(`  ${c.green}✔ Systemd service installed and started!${c.reset}`);
+            } else {
+              const reason = res.error ? res.error.message : `exit code ${res.status}`;
+              console.log(`  ${c.yellow}⚠️ Service installer finished with ${reason}. You can run 'sudo ./deploy/install.sh' manually.${c.reset}`);
+            }
+          } else {
+            console.log(`  ${c.dim}Skipped systemd installation. (To install later: sudo ./deploy/install.sh)${c.reset}`);
+          }
         }
       }
     }
@@ -283,6 +334,7 @@ async function runSetupWizard(options = {}) {
     const report = await runDoctor({ offline: options.offline });
     printReport(report, { offline: options.offline });
 
+    const probeHost = formatProbeHost(chosenHost);
     console.log(`\n${c.green}${c.bold}======================================================${c.reset}`);
     console.log(`${c.bold}              Setup Completed Successfully!            ${c.reset}`);
     console.log(`${c.green}${c.bold}======================================================${c.reset}`);
@@ -290,16 +342,16 @@ async function runSetupWizard(options = {}) {
     console.log(`  ${c.bold}Interactive CLI:${c.reset}    npm run cli        (or ./cli.js)`);
     console.log(`  ${c.bold}Diagnostics:${c.reset}        npm run doctor`);
     console.log(`  ${c.bold}Start Foreground:${c.reset}   npm start`);
-    if (process.platform === 'linux') {
+    if (process.platform === 'linux' && isSystemdAvailable()) {
       console.log(`  ${c.bold}Service Status:${c.reset}     npm run cli service status`);
       console.log(`  ${c.bold}Service Logs:${c.reset}       npm run cli service logs`);
     }
     if (chosenApiKey) {
       console.log(`\nTest API Endpoint:`);
-      console.log(`  curl -H "Authorization: Bearer ${chosenApiKey}" http://${chosenHost}:${chosenPort}/v1/models`);
+      console.log(`  curl -H "Authorization: Bearer ${chosenApiKey}" http://${probeHost}:${chosenPort}/v1/models`);
     } else {
       console.log(`\nTest API Endpoint:`);
-      console.log(`  curl http://${chosenHost}:${chosenPort}/v1/models`);
+      console.log(`  curl http://${probeHost}:${chosenPort}/v1/models`);
     }
     console.log(`${c.green}======================================================${c.reset}\n`);
 
@@ -338,7 +390,7 @@ Options:
 
 if (require.main === module) {
   main()
-    .then(code => process.exit(code || 0))
+    .then(code => process.exit(code ?? 0))
     .catch(e => {
       console.error('[setup] ERROR:', e.message);
       process.exit(1);

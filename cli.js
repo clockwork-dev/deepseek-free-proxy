@@ -8,13 +8,15 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
-const { spawnSync } = require('child_process');
+const { spawnSync, execFileSync } = require('child_process');
 
 const { loadDotEnv } = require('./lib/env');
-const { resolveChromePath } = require('./scripts/ensure_browser');
-const { runDoctor, printReport, checkAuthFile, authPaths } = require('./scripts/doctor');
+const { defaultAuthOutputPath } = require('./scripts/auth_import');
+const { resolveChromePath, findSystemExecutable } = require('./scripts/ensure_browser');
+const { runDoctor, printReport, checkAuthFile, authPaths, isSystemdAvailable, formatProbeHost } = require('./scripts/doctor');
 const { runSetupWizard } = require('./scripts/setup_wizard');
 
 const ROOT = __dirname;
@@ -59,24 +61,52 @@ function waitForEnter(rl, message = 'Press Enter to continue...') {
 }
 
 function runCommandWithSudo(cmd, args, opts = {}) {
-  const isRoot = process.getuid ? process.getuid() === 0 : false;
-  if (isRoot) {
-    return spawnSync(cmd, args, { stdio: 'inherit', ...opts });
-  } else {
-    console.log(`${c.dim}[sudo] Requesting elevated permissions for: ${cmd} ${args.join(' ')}${c.reset}`);
-    return spawnSync('sudo', [cmd, ...args], { stdio: 'inherit', ...opts });
+  const isRoot = typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+  if (isRoot || process.platform === 'win32') {
+    const res = spawnSync(cmd, args, { stdio: 'inherit', ...opts });
+    if (res.error) console.error(`${c.red}Failed to run ${cmd}: ${res.error.message}${c.reset}`);
+    return { ...res, status: res.status ?? 1 };
   }
+  if (!findSystemExecutable('sudo')) {
+    console.error(`${c.red}sudo is not installed and current user is not root. Run as root: ${cmd} ${args.join(' ')}${c.reset}`);
+    return { status: 1 };
+  }
+  console.log(`${c.dim}[sudo] Requesting elevated permissions for: ${cmd} ${args.join(' ')}${c.reset}`);
+  const res = spawnSync('sudo', [cmd, ...args], { stdio: 'inherit', ...opts });
+  if (res.error) console.error(`${c.red}Failed to run sudo ${cmd}: ${res.error.message}${c.reset}`);
+  return { ...res, status: res.status ?? 1 };
 }
 
 // -------------------------------------------------------------------------
 // Service Management
 // -------------------------------------------------------------------------
 function getServiceStatus() {
+  if (process.platform === 'darwin') {
+    const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', 'com.deepseek.free-proxy.plist');
+    if (!fs.existsSync(plistPath)) {
+      return { installed: false, active: false, statusText: 'N/A (Linux only; LaunchAgent not installed)' };
+    }
+    try {
+      const uid = typeof process.getuid === 'function' ? process.getuid() : '';
+      const out = execFileSync('launchctl', ['print', `gui/${uid}/com.deepseek.free-proxy`], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const active = /state\s*=\s*running/i.test(out);
+      return { installed: true, active, statusText: active ? 'active (LaunchAgent)' : 'inactive (LaunchAgent)' };
+    } catch {
+      return { installed: true, active: false, statusText: 'installed (LaunchAgent)' };
+    }
+  }
   if (process.platform !== 'linux') {
     return { installed: false, active: false, statusText: 'N/A (Linux only)' };
   }
   const unitPath = '/etc/systemd/system/free-deepseek-api.service';
-  if (!fs.existsSync(unitPath)) {
+  const installed = fs.existsSync(unitPath);
+  if (!isSystemdAvailable()) {
+    return { installed, active: false, statusText: 'systemd inactive (container/WSL)' };
+  }
+  if (!installed) {
     return { installed: false, active: false, statusText: 'Not installed' };
   }
   try {
@@ -97,13 +127,22 @@ function getServiceStatus() {
 
 function handleServiceCommand(subcommand = 'status', args = []) {
   if (process.platform !== 'linux') {
-    console.log(`${c.yellow}⚠️ Systemd service management is only supported on Linux.${c.reset}`);
+    console.log(`${c.yellow}⚠️ Systemd service management is Linux only (current platform: ${process.platform}).${c.reset}`);
+    if (process.platform === 'darwin') {
+      console.log(`On macOS, manage the LaunchAgent (~/Library/LaunchAgents/com.deepseek.free-proxy.plist) or run '${c.bold}npm start${c.reset}'.`);
+    }
     return 1;
   }
 
   const sub = subcommand.toLowerCase();
   const unitName = 'free-deepseek-api';
   const unitPath = '/etc/systemd/system/free-deepseek-api.service';
+
+  if (!isSystemdAvailable() && sub !== 'uninstall') {
+    console.log(`${c.yellow}⚠️ systemd is not active in this environment (container, WSL without systemd, or non-systemd distro).${c.reset}`);
+    console.log(`Run the proxy in foreground instead: ${c.bold}NON_INTERACTIVE=1 npm start${c.reset}`);
+    return 1;
+  }
 
   switch (sub) {
     case 'status': {
@@ -114,7 +153,7 @@ function handleServiceCommand(subcommand = 'status', args = []) {
       }
       console.log(`${c.bold}=== Systemd Service Status ===${c.reset}`);
       const res = spawnSync('systemctl', ['status', unitName, '--no-pager'], { stdio: 'inherit' });
-      return res.status;
+      return res.status ?? 1;
     }
     case 'start': {
       if (!fs.existsSync(unitPath)) {
@@ -145,30 +184,44 @@ function handleServiceCommand(subcommand = 'status', args = []) {
       return res.status;
     }
     case 'logs': {
+      if (!findSystemExecutable('journalctl')) {
+        console.log(`${c.red}✖ journalctl is not available in this environment.${c.reset}`);
+        return 1;
+      }
       let lines = '50';
       const follow = args.includes('-f') || args.includes('--follow');
-      for (const a of args) {
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
         if (a.startsWith('--lines=')) lines = a.slice(8);
-        else if (a.startsWith('-n=')) lines = a.slice(4);
+        else if (a === '--lines' && args[i + 1]) lines = args[++i];
+        else if (a.startsWith('-n=')) lines = a.slice(3);
+        else if (a === '-n' && args[i + 1]) lines = args[++i];
       }
+      if (!/^\d+$/.test(lines)) lines = '50';
       const journalArgs = ['-u', unitName, '-n', lines];
       if (follow) journalArgs.push('-f');
       else journalArgs.push('--no-pager');
 
       console.log(`${c.bold}=== Service Logs (journalctl) ===${c.reset}`);
       const res = spawnSync('journalctl', journalArgs, { stdio: 'inherit' });
-      return res.status;
+      return res.status ?? 1;
     }
     case 'install': {
       const installScript = path.join(ROOT, 'deploy', 'install.sh');
       console.log(`${c.bold}Installing free-deepseek-api.service...${c.reset}`);
-      const res = runCommandWithSudo(installScript, ['--current-user', ...args]);
+      const hasExplicitUserOrDir = args.some(a =>
+        a === '--current-user' ||
+        a.startsWith('--service-user') ||
+        a.startsWith('--install-dir')
+      );
+      const passArgs = hasExplicitUserOrDir ? args : ['--current-user', ...args];
+      const res = runCommandWithSudo('bash', [installScript, ...passArgs]);
       return res.status;
     }
     case 'uninstall': {
       const uninstallScript = path.join(ROOT, 'deploy', 'uninstall.sh');
       console.log(`${c.bold}Uninstalling free-deepseek-api.service...${c.reset}`);
-      const res = runCommandWithSudo(uninstallScript, args);
+      const res = runCommandWithSudo('bash', [uninstallScript, ...args]);
       return res.status;
     }
     default: {
@@ -266,7 +319,7 @@ async function validateAccountTokens(runLive = false) {
     }
 
     // File permissions
-    if (process.platform !== 'linux' && process.platform !== 'darwin') {
+    if (process.platform === 'win32') {
       console.log(`  ${c.dim}Permissions: Windows ACL${c.reset}`);
     } else {
       try {
@@ -335,13 +388,13 @@ async function handleAuthCommand(subcommand = 'status', args = []) {
       console.log(`${c.bold}Launching DeepSeek Web login helper...${c.reset}`);
       const script = path.join(ROOT, 'scripts', 'deepseek_chrome_auth.js');
       const res = spawnSync(process.execPath, [script, ...args], { stdio: 'inherit', env: process.env });
-      return res.status;
+      return res.status ?? 1;
     }
     case 'import': {
       console.log(`${c.bold}Launching credentials import wizard...${c.reset}`);
       const script = path.join(ROOT, 'scripts', 'auth_import.js');
       const res = spawnSync(process.execPath, [script, ...args], { stdio: 'inherit', env: process.env });
-      return res.status;
+      return res.status ?? 1;
     }
     case 'status':
     case 'validate':
@@ -350,7 +403,7 @@ async function handleAuthCommand(subcommand = 'status', args = []) {
       return await validateAccountTokens(live);
     }
     case 'remove': {
-      const defaultPath = process.env.DEEPSEEK_AUTH_PATH || path.join(ROOT, 'deepseek-auth.json');
+      const defaultPath = defaultAuthOutputPath(process.env, ROOT);
       if (fs.existsSync(defaultPath)) {
         fs.rmSync(defaultPath, { force: true });
         console.log(`${c.green}✔ Removed auth file: ${defaultPath}${c.reset}`);
@@ -373,28 +426,30 @@ async function handleAuthCommand(subcommand = 'status', args = []) {
 async function checkProxyHealth() {
   const port = process.env.PORT || 9655;
   const host = process.env.HOST || '127.0.0.1';
-  const apiKey = process.env.PROXY_API_KEY || '';
+  const probeHost = formatProbeHost(host);
+  let apiKey = process.env.PROXY_API_KEY || '';
+  if (!apiKey && process.env.PROXY_API_KEY_FILE) {
+    try { apiKey = fs.readFileSync(process.env.PROXY_API_KEY_FILE, 'utf8').trim(); } catch {}
+  }
 
-  console.log(`Checking local proxy health at http://${host}:${port}...`);
+  console.log(`Checking local proxy health at http://${probeHost}:${port}...`);
   const headers = {};
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
   const start = Date.now();
-  let modelsOk = false;
   let modelsData = null;
 
   try {
-    const res = await fetch(`http://${host}:${port}/v1/models`, {
+    const res = await fetch(`http://${probeHost}:${port}/v1/models`, {
       headers,
       signal: AbortSignal.timeout(3000),
     });
     const latency = Date.now() - start;
 
     if (res.ok) {
-      modelsOk = true;
       try { modelsData = await res.json(); } catch {}
       console.log(`${c.green}✔ Proxy is healthy and responding!${c.reset} (${latency}ms)`);
-      console.log(`  Endpoint: http://${host}:${port}`);
+      console.log(`  Endpoint: http://${probeHost}:${port}`);
       if (modelsData?.data && Array.isArray(modelsData.data)) {
         const modelNames = modelsData.data.map(m => m.id).join(', ');
         console.log(`  Available models: ${c.bold}${modelNames}${c.reset}`);
@@ -405,9 +460,9 @@ async function checkProxyHealth() {
       return 1;
     }
   } catch (e) {
-    console.log(`${c.red}✖ Proxy is not reachable at http://${host}:${port} (${e.message})${c.reset}`);
+    console.log(`${c.red}✖ Proxy is not reachable at http://${probeHost}:${port} (${e.message})${c.reset}`);
     console.log(`  To start proxy in foreground: ${c.bold}npm start${c.reset}`);
-    if (process.platform === 'linux') {
+    if (process.platform === 'linux' && isSystemdAvailable()) {
       console.log(`  To start background service:   ${c.bold}npm run cli service start${c.reset}`);
     }
     return 1;
@@ -637,14 +692,14 @@ async function main() {
 
   if (command === 'doctor') {
     const doctorScript = path.join(ROOT, 'scripts', 'doctor.js');
-    const res = spawnSync(process.execPath, [doctorScript, ...args.slice(1)], { stdio: 'inherit' });
-    return res.status;
+    const res = spawnSync(process.execPath, [doctorScript, ...args.slice(1)], { stdio: 'inherit', env: process.env });
+    return res.status ?? 1;
   }
 
   if (command === 'setup') {
     const setupScript = path.join(ROOT, 'scripts', 'setup_wizard.js');
-    const res = spawnSync(process.execPath, [setupScript, ...args.slice(1)], { stdio: 'inherit' });
-    return res.status;
+    const res = spawnSync(process.execPath, [setupScript, ...args.slice(1)], { stdio: 'inherit', env: process.env });
+    return res.status ?? 1;
   }
 
   if (command === 'service') {
@@ -666,13 +721,13 @@ async function main() {
     const clientScript = path.join(ROOT, 'client.js');
     const chatArgs = args.slice(1);
     const res = spawnSync(process.execPath, [clientScript, ...chatArgs], { stdio: 'inherit', env: process.env });
-    return res.status;
+    return res.status ?? 1;
   }
 
   if (command === 'start') {
     const serverScript = path.join(ROOT, 'server.js');
     const res = spawnSync(process.execPath, [serverScript, ...args.slice(1)], { stdio: 'inherit', env: process.env });
-    return res.status;
+    return res.status ?? 1;
   }
 
   console.log(`${c.red}Unknown command: ${command}${c.reset}`);

@@ -3,8 +3,9 @@
  * FreeDeepseekAPI - Entrypoint and Backward-Compatible Runner
  */
 
+const path = require('path');
 const { loadDotEnv } = require('./lib/env');
-loadDotEnv();
+if (require.main === module) loadDotEnv(path.join(__dirname, '.env'));
 
 const {
     server,

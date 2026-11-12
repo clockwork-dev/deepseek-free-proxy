@@ -8,11 +8,12 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const dns = require('dns').promises;
 const { execFileSync } = require('child_process');
 const { loadDotEnv } = require('../lib/env');
-const { resolveChromePath } = require('./ensure_browser');
+const { resolveChromePath, findSystemExecutable } = require('./ensure_browser');
 
 const ROOT = path.resolve(__dirname, '..');
 if (require.main === module) loadDotEnv(path.join(ROOT, '.env'));
@@ -49,18 +50,38 @@ function argHas(args, ...names) {
   return args.some(a => names.includes(a));
 }
 
+function formatProbeHost(host) {
+  const h = String(host || '').trim();
+  if (!h || h === '0.0.0.0' || h === '*') return '127.0.0.1';
+  if (h === '::' || h === '[::]') return '[::1]';
+  if (h.includes(':') && !h.startsWith('[')) return `[${h}]`;
+  return h;
+}
+
+function isSystemdAvailable() {
+  if (process.platform !== 'linux') return false;
+  if (!fs.existsSync('/run/systemd/system')) return false;
+  return Boolean(findSystemExecutable('systemctl'));
+}
+
 function authPaths() {
-  if (process.env.DEEPSEEK_AUTH_DIR && fs.existsSync(process.env.DEEPSEEK_AUTH_DIR)) {
-    return fs.readdirSync(process.env.DEEPSEEK_AUTH_DIR)
-      .filter(f => f.endsWith('.json'))
-      .sort()
-      .map(f => path.join(process.env.DEEPSEEK_AUTH_DIR, f));
+  if (process.env.DEEPSEEK_AUTH_DIR) {
+    try {
+      return fs.readdirSync(process.env.DEEPSEEK_AUTH_DIR)
+        .filter(f => f.endsWith('.json'))
+        .sort()
+        .map(f => path.join(process.env.DEEPSEEK_AUTH_DIR, f));
+    } catch {
+      return [];
+    }
   }
   if (process.env.DEEPSEEK_AUTH_PATH) {
     if (process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
-      return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+      const list = process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+      if (list.length) return list;
+    } else if (process.env.DEEPSEEK_AUTH_PATH.trim()) {
+      return [process.env.DEEPSEEK_AUTH_PATH.trim()];
     }
-    return [process.env.DEEPSEEK_AUTH_PATH.trim()];
   }
   return [path.join(ROOT, 'deepseek-auth.json')];
 }
@@ -87,10 +108,21 @@ function checkAuthFile(file) {
     return { file, ok: false, issues: ['auth file missing'], warnings: [], auth: null, metadata: {} };
   }
 
+  let raw;
   try {
-    auth = JSON.parse(fs.readFileSync(file, 'utf8'));
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    return { file, ok: false, issues: [`read error: ${e.message}`], warnings: [], auth: null, metadata: {} };
+  }
+
+  try {
+    auth = JSON.parse(raw);
   } catch (e) {
     return { file, ok: false, issues: [`invalid JSON: ${e.message}`], warnings: [], auth: null, metadata: {} };
+  }
+
+  if (!auth || typeof auth !== 'object' || Array.isArray(auth)) {
+    return { file, ok: false, issues: ['auth JSON must be an object'], warnings: [], auth: null, metadata: {} };
   }
 
   if (!auth.token) issues.push('token missing');
@@ -295,7 +327,8 @@ async function checkNetwork() {
 async function checkLocalProxy() {
   const port = process.env.PORT || 9655;
   const host = process.env.HOST || '127.0.0.1';
-  const url = `http://${host}:${port}/health`;
+  const probeHost = formatProbeHost(host);
+  const url = `http://${probeHost}:${port}/health`;
   try {
     const start = Date.now();
     const resp = await fetch(url, { signal: AbortSignal.timeout(2000) });
@@ -307,7 +340,7 @@ async function checkLocalProxy() {
         port,
         host,
         latencyMs: latency,
-        message: `Local proxy is running on ${host}:${port} (${latency}ms)`,
+        message: `Local proxy is running on ${probeHost}:${port} (${latency}ms)`,
       };
     }
   } catch {}
@@ -315,8 +348,14 @@ async function checkLocalProxy() {
   // Also check /v1/models if /health is not implemented
   try {
     const start = Date.now();
-    const modelsUrl = `http://${host}:${port}/v1/models`;
-    const resp = await fetch(modelsUrl, { signal: AbortSignal.timeout(2000) });
+    const modelsUrl = `http://${probeHost}:${port}/v1/models`;
+    const headers = {};
+    let apiKey = process.env.PROXY_API_KEY || '';
+    if (!apiKey && process.env.PROXY_API_KEY_FILE) {
+      try { apiKey = fs.readFileSync(process.env.PROXY_API_KEY_FILE, 'utf8').trim(); } catch {}
+    }
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const resp = await fetch(modelsUrl, { headers, signal: AbortSignal.timeout(2000) });
     if (resp.ok) {
       return {
         status: 'ok',
@@ -324,7 +363,7 @@ async function checkLocalProxy() {
         port,
         host,
         latencyMs: Date.now() - start,
-        message: `Local proxy is running on ${host}:${port}`,
+        message: `Local proxy is running on ${probeHost}:${port}`,
       };
     }
   } catch {}
@@ -334,11 +373,47 @@ async function checkLocalProxy() {
     running: false,
     port,
     host,
-    message: `Local proxy is not currently running on ${host}:${port} (start with: npm start or cli.js service start)`,
+    message: `Local proxy is not currently running on ${probeHost}:${port} (start with: npm start or cli.js service start)`,
   };
 }
 
 function checkSystemdService() {
+  if (process.platform === 'darwin') {
+    const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', 'com.deepseek.free-proxy.plist');
+    const installed = fs.existsSync(plistPath);
+    if (!installed) {
+      return {
+        status: 'info',
+        installed: false,
+        active: false,
+        message: 'Systemd is only available on Linux (macOS LaunchAgent not installed)',
+      };
+    }
+    try {
+      const uid = typeof process.getuid === 'function' ? process.getuid() : '';
+      const out = execFileSync('launchctl', ['print', `gui/${uid}/com.deepseek.free-proxy`], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        encoding: 'utf8',
+      });
+      const active = /state\s*=\s*running/i.test(out);
+      return {
+        status: active ? 'ok' : 'warn',
+        installed: true,
+        active,
+        message: active
+          ? 'macOS LaunchAgent (com.deepseek.free-proxy): running'
+          : 'macOS LaunchAgent (com.deepseek.free-proxy) is installed but not running',
+      };
+    } catch {
+      return {
+        status: 'warn',
+        installed: true,
+        active: false,
+        message: `macOS LaunchAgent installed (${plistPath}) but status unknown`,
+      };
+    }
+  }
+
   if (process.platform !== 'linux') {
     return {
       status: 'info',
@@ -350,6 +425,16 @@ function checkSystemdService() {
 
   const unitPath = '/etc/systemd/system/free-deepseek-api.service';
   const installed = fs.existsSync(unitPath);
+
+  if (!isSystemdAvailable()) {
+    return {
+      status: 'info',
+      installed,
+      active: false,
+      systemdAvailable: false,
+      message: 'systemd is not active in this environment (container/WSL/non-systemd); run via npm start',
+    };
+  }
 
   if (!installed) {
     return {
@@ -501,9 +586,9 @@ function printReport(report, { offline = false } = {}) {
     else console.log(`  ${TAG.info} ${report.proxy.message}`);
   }
 
-  // 5. Systemd Service
-  if (process.platform === 'linux') {
-    console.log(`\n${c.bold}Systemd Service:${c.reset}`);
+  // 5. Systemd Service / macOS LaunchAgent
+  if (process.platform === 'linux' || (process.platform === 'darwin' && report.systemd?.installed)) {
+    console.log(`\n${c.bold}${process.platform === 'darwin' ? 'Background Service (LaunchAgent):' : 'Systemd Service:'}${c.reset}`);
     if (report.systemd.status === 'ok') console.log(`  ${TAG.ok} ${report.systemd.message}`);
     else if (report.systemd.status === 'warn') console.log(`  ${TAG.warn} ${report.systemd.message}`);
     else console.log(`  ${TAG.info} ${report.systemd.message}`);
@@ -603,4 +688,6 @@ module.exports = {
   checkLocalProxy,
   runDoctor,
   printReport,
+  isSystemdAvailable,
+  formatProbeHost,
 };

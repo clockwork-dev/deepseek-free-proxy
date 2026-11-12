@@ -5,28 +5,57 @@
  * If missing and autoInstall is requested, automatically downloads Chromium via Playwright / npx.
  */
 
-const { spawnSync, execFileSync } = require('child_process');
+const { spawnSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const repoRoot = path.resolve(__dirname, '..');
 const qwenRepoRoot = path.resolve(repoRoot, '..', 'FreeQwenApi');
 
+function isExecutableFile(filePath) {
+    try {
+        const st = fs.statSync(filePath);
+        if (!st.isFile()) return false;
+        if (process.platform !== 'win32') {
+            fs.accessSync(filePath, fs.constants.X_OK);
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function findSystemExecutable(binName) {
+    const pathEnv = process.env.PATH || '';
+    if (!pathEnv) return '';
+    const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+
     if (process.platform === 'win32') {
-        try {
-            const out = execFileSync('where', [binName], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' });
-            const line = out.split(/\r?\n/).find(l => l.trim().length > 0);
-            if (line && fs.existsSync(line.trim())) return line.trim();
-        } catch {}
+        const hasExt = Boolean(path.extname(binName));
+        const pathext = hasExt
+            ? ['']
+            : String(process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
+        for (const dir of dirs) {
+            for (const ext of pathext) {
+                const candidate = path.join(dir, `${binName}${ext}`);
+                if (isExecutableFile(candidate)) return candidate;
+            }
+        }
         return '';
     }
-    try {
-        const out = execFileSync('which', [binName], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' });
-        const line = out.trim();
-        if (line && fs.existsSync(line)) return line;
-    } catch {}
+
+    for (const dir of dirs) {
+        const candidate = path.join(dir, binName);
+        if (isExecutableFile(candidate)) return candidate;
+    }
     return '';
+}
+
+function getHomeDir() {
+    if (process.env.HOME) return process.env.HOME;
+    if (process.env.USERPROFILE) return process.env.USERPROFILE;
+    try { return os.homedir() || ''; } catch { return ''; }
 }
 
 function resolveChromePath() {
@@ -46,71 +75,88 @@ function resolveChromePath() {
         } catch {}
     }
 
-    // 2. Check Puppeteer cache locations (~/.cache/puppeteer/chrome)
-    const home = process.env.HOME || process.env.USERPROFILE || '';
-    if (home) {
-        const pupCacheRoot = path.join(home, '.cache', 'puppeteer', 'chrome');
-        if (fs.existsSync(pupCacheRoot)) {
-            try {
-                const candidates = fs.readdirSync(pupCacheRoot).flatMap((dir) => {
-                    const baseDir = path.join(pupCacheRoot, dir);
-                    if (process.platform === 'darwin') {
-                        return [
-                            path.join(baseDir, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
-                            path.join(baseDir, 'chrome-mac-x64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
-                        ];
-                    }
-                    if (process.platform === 'win32') {
-                        return [
-                            path.join(baseDir, 'chrome-win64', 'chrome.exe'),
-                            path.join(baseDir, 'chrome.exe'),
-                        ];
-                    }
+    const home = getHomeDir();
+    const xdgCache = process.env.XDG_CACHE_HOME || '';
+
+    // 2. Check Puppeteer cache locations (~/.cache/puppeteer/chrome or XDG_CACHE_HOME)
+    const pupCacheRoots = Array.from(new Set([
+        xdgCache ? path.join(xdgCache, 'puppeteer', 'chrome') : '',
+        home ? path.join(home, '.cache', 'puppeteer', 'chrome') : '',
+    ].filter(Boolean)));
+
+    for (const pupCacheRoot of pupCacheRoots) {
+        if (!fs.existsSync(pupCacheRoot)) continue;
+        try {
+            const candidates = fs.readdirSync(pupCacheRoot).sort().flatMap((dir) => {
+                const baseDir = path.join(pupCacheRoot, dir);
+                if (process.platform === 'darwin') {
                     return [
-                        path.join(baseDir, 'chrome-linux64', 'chrome'),
-                        path.join(baseDir, 'chrome-linux64', 'chrome.exe'),
+                        path.join(baseDir, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+                        path.join(baseDir, 'chrome-mac-x64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
                     ];
-                }).filter((p) => p && fs.existsSync(p)).sort().reverse();
+                }
+                if (process.platform === 'win32') {
+                    return [
+                        path.join(baseDir, 'chrome-win64', 'chrome.exe'),
+                        path.join(baseDir, 'chrome-win', 'chrome.exe'),
+                        path.join(baseDir, 'chrome.exe'),
+                    ];
+                }
+                return [
+                    path.join(baseDir, 'chrome-linux64', 'chrome'),
+                    path.join(baseDir, 'chrome-linux', 'chrome'),
+                    path.join(baseDir, 'chrome-linux64', 'chrome.exe'),
+                ];
+            }).filter((p) => p && fs.existsSync(p)).sort().reverse();
 
-                if (candidates[0]) return candidates[0];
-            } catch {}
-        }
+            if (candidates[0]) return candidates[0];
+        } catch {}
+    }
 
-        // 3. Check Playwright cache locations (~/.cache/ms-playwright or %LOCALAPPDATA%\ms-playwright)
-        const pwCacheDirs = [
-            path.join(home, '.cache', 'ms-playwright'),
-            process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'ms-playwright') : '',
-            process.env.PLAYWRIGHT_BROWSERS_PATH || '',
-        ].filter(Boolean);
+    // 3. Check Playwright cache locations (checked even when HOME is unset)
+    const pwCacheDirs = Array.from(new Set([
+        process.env.PLAYWRIGHT_BROWSERS_PATH && process.env.PLAYWRIGHT_BROWSERS_PATH !== '0'
+            ? process.env.PLAYWRIGHT_BROWSERS_PATH
+            : '',
+        xdgCache ? path.join(xdgCache, 'ms-playwright') : '',
+        home ? path.join(home, '.cache', 'ms-playwright') : '',
+        process.platform === 'darwin' && home ? path.join(home, 'Library', 'Caches', 'ms-playwright') : '',
+        process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'ms-playwright') : '',
+    ].filter(Boolean)));
 
-        for (const pwCache of pwCacheDirs) {
-            if (fs.existsSync(pwCache)) {
-                try {
-                    const entries = fs.readdirSync(pwCache);
-                    // Search for chromium-* folders
-                    const chromiumDirs = entries
-                        .filter(e => e.startsWith('chromium-'))
-                        .map(e => path.join(pwCache, e));
+    for (const pwCache of pwCacheDirs) {
+        if (!fs.existsSync(pwCache)) continue;
+        try {
+            const entries = fs.readdirSync(pwCache);
+            const chromiumDirs = entries
+                .filter(e => /^(?:chromium|chromium_headless_shell)-/.test(e))
+                .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+                .reverse()
+                .map(e => path.join(pwCache, e));
 
-                    for (const cDir of chromiumDirs.reverse()) {
-                        const candidates = [
-                            // Linux
-                            path.join(cDir, 'chrome-linux', 'chrome'),
-                            path.join(cDir, 'chrome-linux64', 'chrome'),
-                            // Mac
-                            path.join(cDir, 'chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
-                            path.join(cDir, 'chrome-mac-arm64', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
-                            // Windows
-                            path.join(cDir, 'chrome-win', 'chrome.exe'),
+            for (const cDir of chromiumDirs) {
+                const candidates = process.platform === 'darwin'
+                    ? [
+                        path.join(cDir, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+                        path.join(cDir, 'chrome-mac-x64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+                        path.join(cDir, 'chrome-mac', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+                        path.join(cDir, 'chrome-mac-arm64', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
+                        path.join(cDir, 'chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
+                    ]
+                    : process.platform === 'win32'
+                        ? [
                             path.join(cDir, 'chrome-win64', 'chrome.exe'),
+                            path.join(cDir, 'chrome-win', 'chrome.exe'),
+                        ]
+                        : [
+                            path.join(cDir, 'chrome-linux64', 'chrome'),
+                            path.join(cDir, 'chrome-linux', 'chrome'),
                         ];
-                        for (const cand of candidates) {
-                            if (fs.existsSync(cand)) return cand;
-                        }
-                    }
-                } catch {}
+                for (const cand of candidates) {
+                    if (fs.existsSync(cand)) return cand;
+                }
             }
-        }
+        } catch {}
     }
 
     // 4. Check system binaries via PATH
@@ -125,12 +171,16 @@ function resolveChromePath() {
 
     // 5. Check well-known OS default install paths
     if (process.platform === 'win32') {
+        const pf = process.env.PROGRAMFILES || 'C:\\Program Files';
+        const pf86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
+        const localApp = process.env.LOCALAPPDATA || '';
         const candidates = [
-            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-            'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-            'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-        ];
+            path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            localApp ? path.join(localApp, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+            path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+            path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        ].filter(Boolean);
         for (const c of candidates) {
             if (fs.existsSync(c)) return c;
         }
@@ -140,7 +190,11 @@ function resolveChromePath() {
             '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
             '/Applications/Chromium.app/Contents/MacOS/Chromium',
             '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-        ];
+            home ? path.join(home, 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome') : '',
+            home ? path.join(home, 'Applications', 'Chromium.app', 'Contents', 'MacOS', 'Chromium') : '',
+            '/opt/homebrew/bin/chromium',
+            '/usr/local/bin/chromium',
+        ].filter(Boolean);
         for (const c of candidates) {
             if (fs.existsSync(c)) return c;
         }
@@ -150,6 +204,9 @@ function resolveChromePath() {
             '/usr/bin/google-chrome-stable',
             '/usr/bin/chromium',
             '/usr/bin/chromium-browser',
+            '/usr/lib/chromium/chromium',
+            '/usr/lib64/chromium-browser/chromium-browser',
+            '/opt/google/chrome/chrome',
             '/snap/bin/chromium',
             '/usr/bin/microsoft-edge',
         ];
@@ -165,20 +222,40 @@ function installPlaywrightChromium() {
     console.log('[browser] Браузер Chrome/Chromium не обнаружен в системе.');
     console.log('[browser] Автоматическая установка Chromium через npx --yes playwright...');
 
-    const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-    const result = spawnSync(npxCmd, ['--yes', 'playwright', 'install', 'chromium'], {
-        stdio: 'inherit',
-        env: process.env,
-        shell: false,
-    });
+    const args = ['--yes', 'playwright', 'install', 'chromium'];
+    const npxCliCandidates = [
+        path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+        path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+    ];
+    const npxCli = npxCliCandidates.find(p => fs.existsSync(p));
 
+    let result;
+    if (npxCli) {
+        result = spawnSync(process.execPath, [npxCli, ...args], {
+            stdio: 'inherit',
+            env: process.env,
+            shell: false,
+        });
+    } else {
+        const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+        result = spawnSync(npxCmd, args, {
+            stdio: 'inherit',
+            env: process.env,
+            // Windows Node >=18.20/20.12 rejects .cmd without shell:true (EINVAL)
+            shell: process.platform === 'win32',
+        });
+    }
+
+    if (result.error) {
+        console.warn(`[browser] Не удалось запустить npx: ${result.error.message}`);
+        return '';
+    }
     if (result.status === 0) {
         console.log('[browser] Chromium успешно установлен через Playwright.');
         return resolveChromePath();
-    } else {
-        console.warn(`[browser] Ошибка при установке Chromium через npx playwright (код ${result.status}).`);
-        return '';
     }
+    console.warn(`[browser] Ошибка при установке Chromium через npx playwright (код ${result.status}).`);
+    return '';
 }
 
 function ensureBrowser(autoInstall = true) {
@@ -232,4 +309,5 @@ module.exports = {
     resolveChromePath,
     ensureBrowser,
     installPlaywrightChromium,
+    findSystemExecutable,
 };

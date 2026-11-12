@@ -177,22 +177,49 @@ function isSupportedVisionMime(mime) {
 /**
  * SSRF validation: check if a hostname is private or loopback.
  */
+function extractMappedIpv4(host) {
+    const dottedMatch = host.match(/^(?:::ffff(?::0)?|(?:0+:){5}ffff):(\d{1,3}(?:\.\d{1,3}){3})$/i);
+    if (dottedMatch) return dottedMatch[1];
+    const hexMatch = host.match(/^(?:::ffff(?::0)?|(?:0+:){5}ffff):([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (hexMatch) {
+        const hi = parseInt(hexMatch[1], 16);
+        const lo = parseInt(hexMatch[2], 16);
+        return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    }
+    return null;
+}
+
 function isPrivateHost(hostname) {
-    const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+    const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+    if (!host) return true;
     if (isLoopbackHost(host)) return true;
-    // IPv4 private ranges
-    if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2[0-9]|3[01])\./.test(host) || /^169\.254\./.test(host)) {
+    if (/\.localhost$/.test(host)) return true;
+    if (/^::(?:0+)?$/.test(host) || /^(?:0+:){7}0*1?$/.test(host)) return true;
+
+    const mappedIpv4 = extractMappedIpv4(host);
+    if (mappedIpv4) return isPrivateHost(mappedIpv4);
+
+    // IPv4 private / special-use ranges
+    if (
+        /^0\./.test(host) ||
+        /^127\./.test(host) ||
+        /^10\./.test(host) ||
+        /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host) ||
+        /^169\.254\./.test(host) ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+        /^192\.168\./.test(host)
+    ) {
         return true;
     }
-    // IPv6 unique local / link local
-    if (/^fe80:/i.test(host) || /^fc00:/i.test(host) || /^fd[0-9a-f]{2}:/i.test(host)) {
+    // IPv6 unique local (fc00::/7) / link-local (fe80::/10)
+    if (/^fe[89ab][0-9a-f]:/i.test(host) || /^f[cd][0-9a-f]{2}:/i.test(host)) {
         return true;
     }
     return false;
 }
 
 /**
- * Fetch remote image URL with timeout, bounds checking, and MIME detection.
+ * Fetch remote image URL with timeout, bounds checking, redirect SSRF checks, and MIME detection.
  */
 async function fetchRemoteImage(url, { signal, timeoutMs = REMOTE_IMAGE_FETCH_TIMEOUT_MS, maxBytes = MAX_IMAGE_BYTES, allowPrivate = false } = {}) {
     if (!url || typeof url !== 'string') return null;
@@ -213,35 +240,94 @@ async function fetchRemoteImage(url, { signal, timeoutMs = REMOTE_IMAGE_FETCH_TI
     }
 
     const controller = new AbortController();
+    const onOuterAbort = () => controller.abort(signal.reason);
+    if (signal) {
+        if (signal.aborted) controller.abort(signal.reason);
+        else signal.addEventListener('abort', onOuterAbort, { once: true });
+    }
     const timer = setTimeout(() => controller.abort(new Error(`Timeout fetching remote image after ${timeoutMs}ms`)), timeoutMs);
-    const combinedSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 
     try {
-        const resp = await fetch(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; DeepSeekProxy/1.0; +https://github.com/deepseek-free-proxy)',
-                'Accept': 'image/png,image/jpeg,image/webp,image/gif,*/*;q=0.8',
-            },
-            signal: combinedSignal,
-        });
+        const maxRedirects = 5;
+        let currentUrl = url;
+        let resp = null;
+        for (let hop = 0; hop <= maxRedirects; hop++) {
+            resp = await fetch(currentUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; DeepSeekProxy/1.0; +https://github.com/deepseek-free-proxy)',
+                    'Accept': 'image/png,image/jpeg,image/webp,image/gif,*/*;q=0.8',
+                },
+                redirect: 'manual',
+                signal: controller.signal,
+            });
 
-        if (!resp.ok) {
-            console.warn(`[multimodal] Remote image fetch failed: HTTP ${resp.status} for ${url}`);
+            if (resp.status >= 300 && resp.status < 400) {
+                const loc = resp.headers.get('location');
+                try { await resp.body?.cancel?.(); } catch {}
+                if (!loc || hop === maxRedirects) {
+                    console.warn(`[multimodal] Remote image redirect rejected for ${currentUrl}`);
+                    return null;
+                }
+                let nextParsed;
+                try {
+                    nextParsed = new URL(loc, currentUrl);
+                } catch {
+                    return null;
+                }
+                if (nextParsed.protocol !== 'http:' && nextParsed.protocol !== 'https:') {
+                    return null;
+                }
+                if (!allowPrivate && isPrivateHost(nextParsed.hostname)) {
+                    console.warn(`[multimodal] SSRF protection blocked redirect to private host: ${nextParsed.hostname}`);
+                    return null;
+                }
+                currentUrl = nextParsed.href;
+                continue;
+            }
+            break;
+        }
+
+        if (!resp || !resp.ok) {
+            console.warn(`[multimodal] Remote image fetch failed: HTTP ${resp?.status} for ${currentUrl}`);
             return null;
         }
 
         const contentLength = Number(resp.headers.get('content-length'));
         if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-            console.warn(`[multimodal] Remote image ${url} content-length (${contentLength}) exceeds limit of ${maxBytes} bytes`);
+            try { await resp.body?.cancel?.(); } catch {}
+            console.warn(`[multimodal] Remote image ${currentUrl} content-length (${contentLength}) exceeds limit of ${maxBytes} bytes`);
             return null;
         }
 
-        const arrayBuffer = await resp.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
+        let buffer;
+        if (resp.body && typeof resp.body.getReader === 'function') {
+            const reader = resp.body.getReader();
+            const chunks = [];
+            let total = 0;
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    total += value.byteLength;
+                    if (total > maxBytes) {
+                        try { await reader.cancel(); } catch {}
+                        console.warn(`[multimodal] Remote image ${currentUrl} (${total}+ bytes) exceeds limit of ${maxBytes} bytes`);
+                        return null;
+                    }
+                    chunks.push(Buffer.from(value));
+                }
+            } finally {
+                try { reader.releaseLock(); } catch {}
+            }
+            buffer = Buffer.concat(chunks, total);
+        } else {
+            const arrayBuffer = await resp.arrayBuffer();
+            buffer = Buffer.from(arrayBuffer);
+        }
 
         if (buffer.length === 0) return null;
         if (buffer.length > maxBytes) {
-            console.warn(`[multimodal] Remote image ${url} (${buffer.length} bytes) exceeds limit of ${maxBytes} bytes`);
+            console.warn(`[multimodal] Remote image ${currentUrl} (${buffer.length} bytes) exceeds limit of ${maxBytes} bytes`);
             return null;
         }
 
@@ -252,7 +338,7 @@ async function fetchRemoteImage(url, { signal, timeoutMs = REMOTE_IMAGE_FETCH_TI
         }
 
         if (!isSupportedVisionMime(mime)) {
-            console.warn(`[multimodal] Unsupported image MIME "${mime}" for remote image ${url}`);
+            console.warn(`[multimodal] Unsupported image MIME "${mime}" for remote image ${currentUrl}`);
             return null;
         }
 
@@ -270,6 +356,7 @@ async function fetchRemoteImage(url, { signal, timeoutMs = REMOTE_IMAGE_FETCH_TI
         return null;
     } finally {
         clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onOuterAbort);
     }
 }
 
