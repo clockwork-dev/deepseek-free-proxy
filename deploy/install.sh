@@ -14,6 +14,19 @@ log_ok() { echo -e "${GREEN}[OK]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err() { echo -e "${RED}[ERROR]${NC} $*"; }
 
+# Handle --help / -h early before requiring root
+for arg in "$@"; do
+    if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+        echo "Использование: sudo ./deploy/install.sh [options]"
+        echo "Опции:"
+        echo "  --current-user       Запускать сервис от имени вызывающего пользователя (\${SUDO_USER:-\$(id -un)}) вместо freedeepseek"
+        echo "  --non-interactive, -y Не задавать вопросов, использовать значения по умолчанию"
+        echo "  --port=PORT          Порт прокси (по умолчанию 9655)"
+        echo "  --dir=PATH           Путь к директории проекта"
+        exit 0
+    fi
+done
+
 # 1. Check Root / Sudo
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     log_err "Этот скрипт должен запускаться с правами root (или через sudo)."

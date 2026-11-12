@@ -722,3 +722,61 @@ test('Responses response.completed lists exactly the streamed items', async () =
   assert.equal(completed.output[0].summary[0].text, 'first thoughts');
   assert.equal(completed.output_text, 'Answer');
 });
+
+test('API endpoints return clean JSON responses without any watermarks or promotional metadata', async () => {
+  mock.state.respond = () => ({ text: 'Clean response text from mock upstream' });
+
+  // 1. GET / (health check)
+  const healthRes = await fetch(`${proxyUrl}/`);
+  assert.equal(healthRes.status, 200);
+  const healthJson = await healthRes.json();
+  assert.equal(healthJson.watermark, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(healthJson, 'watermark'), false);
+  assert.equal(JSON.stringify(healthJson).toLowerCase().includes('forgetmeai'), false);
+
+  // 2. GET /v1/models
+  const modelsRes = await fetch(`${proxyUrl}/v1/models`);
+  assert.equal(modelsRes.status, 200);
+  const modelsJson = await modelsRes.json();
+  assert.equal(modelsJson.watermark, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(modelsJson, 'watermark'), false);
+
+  // 3. GET /v1/model-capabilities
+  const capsRes = await fetch(`${proxyUrl}/v1/model-capabilities`);
+  assert.equal(capsRes.status, 200);
+  const capsJson = await capsRes.json();
+  assert.equal(capsJson.watermark, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(capsJson, 'watermark'), false);
+
+  // 4. POST /v1/chat/completions (OpenAI)
+  const chatRes = await chat({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'hello' }] });
+  assert.equal(chatRes.status, 200);
+  assert.equal(chatRes.json.watermark, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(chatRes.json, 'watermark'), false);
+  assert.equal(JSON.stringify(chatRes.json).toLowerCase().includes('forgetmeai'), false);
+
+  // 5. POST /v1/messages (Anthropic format with supported model)
+  const anthropicRes = await fetch(`${proxyUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-chat', max_tokens: 100, messages: [{ role: 'user', content: 'hello' }] }),
+  });
+  assert.equal(anthropicRes.status, 200);
+  const anthropicJson = await anthropicRes.json();
+  assert.equal(anthropicJson.watermark, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(anthropicJson, 'watermark'), false);
+  assert.equal(JSON.stringify(anthropicJson).toLowerCase().includes('forgetmeai'), false);
+
+  // 6. POST /v1/responses
+  const responsesRes = await fetch(`${proxyUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-chat', input: 'hello' }),
+  });
+  assert.equal(responsesRes.status, 200);
+  const responsesJson = await responsesRes.json();
+  assert.equal(responsesJson.watermark, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(responsesJson, 'watermark'), false);
+  assert.equal(JSON.stringify(responsesJson).toLowerCase().includes('forgetmeai'), false);
+});
+
