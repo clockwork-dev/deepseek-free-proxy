@@ -6,6 +6,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/clockwork-dev/deepseek-free-proxy/main/deploy/quick-install.sh | bash -s -- --port=9655
 set -euo pipefail
 
+BACKUP_DIR=""
+
 main() {
     # ------------------------------------------------------------------
     # Colors & logging
@@ -484,9 +486,8 @@ EOF
     # ------------------------------------------------------------------
     # Clone or safely update repository, preserving .env & deepseek-auth.json
     # ------------------------------------------------------------------
-    local BACKUP_DIR
     BACKUP_DIR="$(mktemp -d)"
-    trap 'rm -rf "$BACKUP_DIR"' EXIT
+    trap '[[ -n "${BACKUP_DIR:-}" ]] && rm -rf "$BACKUP_DIR"' EXIT
 
     backup_user_files() {
         local target="$1"
@@ -543,12 +544,13 @@ EOF
 
     if [[ -d "$INSTALL_DIR/.git" ]]; then
         log_info "Updating existing repository in $INSTALL_DIR (branch: $REPO_BRANCH)..."
-        if [[ -n "$(git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+        if [[ -n "$(git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" -c core.fileMode=false status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
             log_warn "Local tracked modifications detected in $INSTALL_DIR; skipping git pull to avoid overwriting local changes."
         else
-            git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" fetch --depth 1 origin "$REPO_BRANCH"
-            git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" pull --ff-only origin "$REPO_BRANCH" || \
-                log_warn "Could not fast-forward $INSTALL_DIR; keeping current checkout."
+            git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" -c core.fileMode=false fetch --depth 1 origin "$REPO_BRANCH"
+            if ! git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" -c core.fileMode=false merge --ff-only FETCH_HEAD 2>/dev/null; then
+                git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" -c core.fileMode=false reset --hard FETCH_HEAD
+            fi
         fi
     elif [[ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
         log_info "Populating existing directory $INSTALL_DIR with fresh clone while preserving .env and deepseek-auth.json..."
@@ -577,9 +579,20 @@ EOF
     log_info "Running npm install --omit=dev in $INSTALL_DIR..."
     (cd "$INSTALL_DIR" && npm install --omit=dev)
 
-    # Ensure scripts remain executable
-    chmod +x "$INSTALL_DIR/server.js" "$INSTALL_DIR/cli.js" "$INSTALL_DIR/client.js" 2>/dev/null || true
-    chmod +x "$INSTALL_DIR/deploy/"*.sh "$INSTALL_DIR/scripts/"*.js 2>/dev/null || true
+    # Ensure intended entrypoints remain executable without flipping tracked 0644 files
+    chmod +x \
+        "$INSTALL_DIR/server.js" \
+        "$INSTALL_DIR/cli.js" \
+        "$INSTALL_DIR/client.js" \
+        "$INSTALL_DIR/deploy/install.sh" \
+        "$INSTALL_DIR/deploy/uninstall.sh" \
+        "$INSTALL_DIR/deploy/quick-install.sh" \
+        "$INSTALL_DIR/scripts/auth.js" \
+        "$INSTALL_DIR/scripts/deepseek_chrome_auth.js" \
+        "$INSTALL_DIR/scripts/ensure_browser.js" \
+        "$INSTALL_DIR/scripts/setup_wizard.js" \
+        "$INSTALL_DIR/scripts/probe_deepseek_models.js" \
+        "$INSTALL_DIR/scripts/live_agentic_smoke_tests.mjs" 2>/dev/null || true
 
     # ------------------------------------------------------------------
     # Optional browser check / setup
