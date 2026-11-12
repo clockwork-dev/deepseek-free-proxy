@@ -19,7 +19,21 @@ test('security: codebase contains zero traces of watermark or old author brandin
     'scripts/ensure_browser.js',
     'scripts/deepseek_chrome_auth.js',
     'lib/pow.js',
-    'lib/env.js'
+    'lib/env.js',
+    'src/server.js',
+    'src/routes/index.js',
+    'src/routes/chat.js',
+    'src/routes/models.js',
+    'src/routes/sessions.js',
+    'src/routes/health.js',
+    'src/deepseek/client.js',
+    'src/deepseek/multimodal.js',
+    'src/deepseek/prompt.js',
+    'src/accounts/pool.js',
+    'src/tools/parser.js',
+    'src/sessions/manager.js',
+    'src/utils/auth.js',
+    'src/utils/streaming.js'
   ];
 
   const forbiddenTerms = [
