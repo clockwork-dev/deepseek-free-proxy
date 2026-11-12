@@ -1,5 +1,8 @@
 node_modules/
 .env
+*.env
+.env.*
+!.env.example
 *.log
 auth.json
 deepseek-auth.json
@@ -12,5 +15,11 @@ data/accounts/*.json
 .chrome-for-testing-profile-deepseek.stale-*/
 *.session.json
 /tmp/deepseek_response_*
+*.dump
+*.dump.json
+test-dumps/
+dumps/
+coverage/
+.nyc_output/
 .DS_Store
 *.pdf
