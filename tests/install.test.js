@@ -82,6 +82,11 @@ test('deploy scripts enforce strict shell safety, umask, pipe safety, and valid 
   }
 
   // curl | bash safety: entire script parsed inside main() before execution
+  assert.match(quickInstall, /^BACKUP_DIR=""$/m);
+  assert.doesNotMatch(quickInstall, /\blocal\s+BACKUP_DIR\b/);
+  assert.match(quickInstall, /trap '.*"\$\{BACKUP_DIR:-\}"/);
+  assert.doesNotMatch(quickInstall, /scripts\/"?\*\.js/);
+  assert.match(quickInstall, /-c core\.fileMode=false status --porcelain/);
   assert.match(quickInstall, /^main\(\) \{/m);
   assert.match(quickInstall, /\nmain "\$@"\s*$/);
   // Safe /dev/tty interactive prompting when stdin is piped
@@ -417,6 +422,66 @@ ensure_local_env_and_auth`,
     assert.equal(preserveRes.status, 0, preserveRes.stderr);
     assert.equal(fs.readFileSync(path.join(fakeInstallDir, '.env'), 'utf8'), 'PROXY_API_KEY="keep-me"\n');
     assert.equal(fs.readFileSync(path.join(fakeInstallDir, 'deepseek-auth.json'), 'utf8'), '{"token":"keep-tok"}\n');
+
+    // 3. Regression test (#43/#44): BACKUP_DIR EXIT trap cleans up and exits 0 after main() returns
+    const trapTarget = path.join(tmpDir, 'trap-backup-dir');
+    const trapScript = `
+set -euo pipefail
+BACKUP_DIR=""
+main() {
+  BACKUP_DIR="${trapTarget}"
+  mkdir -p "$BACKUP_DIR"
+  echo "tmp" > "$BACKUP_DIR/file"
+  trap '[[ -n "\${BACKUP_DIR:-}" ]] && rm -rf "$BACKUP_DIR"' EXIT
+}
+main
+`;
+    const trapRes = spawnSync('bash', ['-c', trapScript], { encoding: 'utf8' });
+    assert.equal(trapRes.status, 0, `EXIT trap regression failed:\n${trapRes.stderr}`);
+    assert.equal(fs.existsSync(trapTarget), false, 'EXIT trap must remove BACKUP_DIR cleanly');
+
+    // 4. Regression test (#43/#44): idempotent re-run ignores fileMode flips via -c core.fileMode=false
+    if (spawnSync('git', ['--version'], { encoding: 'utf8' }).status === 0) {
+      const bareRepo = path.join(tmpDir, 'origin.git');
+      const workRepo = path.join(tmpDir, 'work');
+      const cloneRepo = path.join(tmpDir, 'installed');
+      assert.equal(spawnSync('git', ['init', '--bare', bareRepo], { encoding: 'utf8' }).status, 0);
+      assert.equal(spawnSync('git', ['clone', bareRepo, workRepo], { encoding: 'utf8' }).status, 0);
+      fs.writeFileSync(path.join(workRepo, 'doctor.js'), '// v1\n', { mode: 0o644 });
+      spawnSync('git', ['-C', workRepo, 'config', 'user.email', 'test@example.com'], { encoding: 'utf8' });
+      spawnSync('git', ['-C', workRepo, 'config', 'user.name', 'Test'], { encoding: 'utf8' });
+      spawnSync('git', ['-C', workRepo, 'add', 'doctor.js'], { encoding: 'utf8' });
+      spawnSync('git', ['-C', workRepo, 'commit', '-m', 'init'], { encoding: 'utf8' });
+      assert.equal(spawnSync('git', ['-C', workRepo, 'push', 'origin', 'HEAD:main'], { encoding: 'utf8' }).status, 0);
+
+      assert.equal(spawnSync('git', ['clone', '--branch', 'main', bareRepo, cloneRepo], { encoding: 'utf8' }).status, 0);
+      fs.chmodSync(path.join(cloneRepo, 'doctor.js'), 0o755);
+
+      fs.writeFileSync(path.join(workRepo, 'doctor.js'), '// v2\n', { mode: 0o644 });
+      spawnSync('git', ['-C', workRepo, 'commit', '-am', 'update'], { encoding: 'utf8' });
+      assert.equal(spawnSync('git', ['-C', workRepo, 'push', 'origin', 'HEAD:main'], { encoding: 'utf8' }).status, 0);
+
+      const updateRes = spawnSync(
+        'bash',
+        [
+          '-c',
+          `set -euo pipefail
+INSTALL_DIR="${cloneRepo}"
+REPO_BRANCH="main"
+if [[ -n "$(git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" -c core.fileMode=false status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  echo "SKIPPED"
+  exit 1
+fi
+git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" -c core.fileMode=false fetch --depth 1 origin "$REPO_BRANCH"
+if ! git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" -c core.fileMode=false merge --ff-only FETCH_HEAD 2>/dev/null; then
+  git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" -c core.fileMode=false reset --hard FETCH_HEAD
+fi`,
+        ],
+        { encoding: 'utf8' },
+      );
+      assert.equal(updateRes.status, 0, `Idempotent update check failed:\n${updateRes.stderr}`);
+      assert.equal(fs.readFileSync(path.join(cloneRepo, 'doctor.js'), 'utf8'), '// v2\n');
+    }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
